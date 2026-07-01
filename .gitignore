@@ -1,0 +1,8 @@
+build/
+*.obj
+*.exe
+*.dll
+.vs/
+*.user
+CMakeCache.txt
+imgui.ini
