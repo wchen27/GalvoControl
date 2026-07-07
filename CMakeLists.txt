@@ -60,6 +60,10 @@ if(UNIX)
         INSTALL_RPATH "${RSI_DIR};${RSI_DIR}/lib;${RSI_DIR}/lib/x64")
 endif()
 
+if(WIN32)
+    target_link_libraries(motor_control PRIVATE ws2_32)   # UDP target receiver (Winsock)
+endif()
+
 # NOTE (Windows): RapidCode64.dll and its dependencies (KDL.dll, VMPlugin*, RMP.rta) are
 # loaded from RSI_DIR via PATH - see run.bat. Do NOT copy RapidCode64.dll next to the exe;
 # that breaks RapidCode's relative resolution of the RMP runtime.
