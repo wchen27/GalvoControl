@@ -6,3 +6,4 @@ build/
 *.user
 CMakeCache.txt
 imgui.ini
+motor_control.cfg
