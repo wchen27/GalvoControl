@@ -80,7 +80,7 @@ idempotent, so duplicate delivery is harmless. Every reply carries full status.
 | 0   | PING        | - (status query; keepalive for calib mode) |
 | 1   | SET_ANGLES  | `[0]`=pan, `[1]`=tilt - displayed motor degrees; clamped to travel limits (err=4 if clamped) |
 | 2   | CALIB_MODE  | `[0]` = 0/1 |
-| 3   | SET_CALIB   | `[0..2]`=base xyz mm, `[3..5]`=rot Euler XYZ deg (R=Rz*Ry*Rx, residual world->galvo applied after the coord-frame mapping), `[6..8]`=pan sign/scale/offset, `[9..11]`=tilt sign/scale/offset. Deactivates an active teach (affine) calibration -- last calibration wins. |
+| 3   | SET_CALIB   | `[0..2]`=base xyz mm, `[3..5]`=rot Euler XYZ deg (R=Rz*Ry*Rx, the FULL world->galvo alignment fitted on raw sender coordinates), `[6..8]`=pan sign/scale/offset, `[9..11]`=tilt sign/scale/offset. Resets the coord-frame mapping to identity and deactivates an active teach (affine) calibration -- last calibration wins. |
 | 4   | SAVE_CONFIG | - (persist current config to motor_control.cfg) |
 | 5   | STOP        | - (abort the pan/tilt axes; always allowed) |
 

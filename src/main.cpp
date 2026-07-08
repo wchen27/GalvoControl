@@ -831,9 +831,14 @@ static int32_t ctrl_dispatch(const GcCommandPacket& pkt) {
             g_tgt.tilt_sign   = (float)pkt.args[9];
             g_tgt.tilt_scale  = (float)pkt.args[10];
             g_tgt.tilt_offset = (float)pkt.args[11];
-            // last calibration wins: the uploaded diagonal model must actually
-            // drive aiming, so retire an active teach (affine) calibration
+            // last calibration wins: the uploaded model must actually drive
+            // aiming, so retire an active teach (affine) calibration and
+            // reset the coord-frame mapping -- the uploaded rot IS the full
+            // world->galvo alignment, fitted on raw sender coordinates
             g_cal_active = false;
+            g_xf.ax[0] = 0; g_xf.ax[1] = 1; g_xf.ax[2] = 2;
+            g_xf.sgn[0] = g_xf.sgn[1] = g_xf.sgn[2] = 1.0f;
+            g_xf.scale = 1.0f;
             return 0;
         case GC_CMD_SAVE_CONFIG:
             if (!g_remote_allowed) return 2;
