@@ -23,6 +23,7 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -310,6 +311,7 @@ static constexpr double RAD2DEG = 57.29577951308232;
 
 struct TargetConfig {
     float base[3] = {0.0f, 0.0f, 0.0f};
+    float rot[3]  = {0.0f, 0.0f, 0.0f};   // world->galvo frame, Euler XYZ deg (R = Rz*Ry*Rx)
     int   pan_axis  = 0;
     int   tilt_axis = 1;
     float pan_sign  = 1.0f, pan_scale  = 0.5f, pan_offset  = 0.0f;
@@ -321,12 +323,36 @@ static bool  g_moving_target = false;
 
 struct PanTilt { double pan_motor, tilt_motor, az, el; };
 
+// v_galvo = R^T * (target - base), R = Rz(rz)*Ry(ry)*Rx(rx). Identity rot
+// reproduces the old axis-aligned behavior.
+static void targeting_world_to_galvo(const float* target, double* v) {
+    const double DEG2RAD = 1.0 / RAD2DEG;
+    double rx = g_tgt.rot[0] * DEG2RAD;
+    double ry = g_tgt.rot[1] * DEG2RAD;
+    double rz = g_tgt.rot[2] * DEG2RAD;
+    double cx = cos(rx), sx = sin(rx);
+    double cy = cos(ry), sy = sin(ry);
+    double cz = cos(rz), sz = sin(rz);
+    // rows of R = Rz*Ry*Rx
+    double R[3][3] = {
+        {cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx},
+        {sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx},
+        {-sy,     cy * sx,                cy * cx},
+    };
+    double d[3] = {target[0] - g_tgt.base[0],
+                   target[1] - g_tgt.base[1],
+                   target[2] - g_tgt.base[2]};
+    // v = R^T * d
+    for (int i = 0; i < 3; i++) {
+        v[i] = R[0][i] * d[0] + R[1][i] * d[1] + R[2][i] * d[2];
+    }
+}
+
 static PanTilt targeting_solve(const float* target) {
-    double dx = target[0] - g_tgt.base[0];
-    double dy = target[1] - g_tgt.base[1];
-    double dz = target[2] - g_tgt.base[2];
-    double az = atan2(dx, dz) * RAD2DEG;
-    double el = atan2(dy, sqrt(dx * dx + dz * dz)) * RAD2DEG;
+    double v[3];
+    targeting_world_to_galvo(target, v);
+    double az = atan2(v[0], v[2]) * RAD2DEG;
+    double el = atan2(v[1], sqrt(v[0] * v[0] + v[2] * v[2])) * RAD2DEG;
     PanTilt pt;
     pt.az = az; pt.el = el;
     pt.pan_motor  = g_tgt.pan_sign  * az * g_tgt.pan_scale  + g_tgt.pan_offset;
@@ -351,6 +377,233 @@ static void targeting_aim(const float* target) {
 // (PVT streaming for smooth tracking is deferred until it can be brought up on live
 //  hardware - the MovePVT buffer/time semantics need validation. Tracking below uses
 //  discrete re-aim of both axes, which is proven to move pan+tilt together.)
+
+// ---------------------------------------------------------------------------
+// control channel (UDP request/reply, GCC1 in -> GCS1 out). See PROTOCOL.md.
+// Polled on the UI thread each frame so all RapidCode calls stay there.
+// ---------------------------------------------------------------------------
+static void config_save();
+
+#pragma pack(push, 1)
+struct GcCommandPacket {
+    char     magic[4];      // 'G','C','C','1'
+    uint16_t version;       // = 1
+    uint16_t cmd;
+    uint32_t seq;
+    uint32_t reserved;
+    double   args[14];
+};
+struct GcStatusPacket {
+    char     magic[4];      // 'G','C','S','1'
+    uint16_t version;       // = 1
+    uint16_t cmd;           // echoed
+    uint32_t seq;           // echoed
+    uint32_t flags;         // bit0 ok, bit1 in_position, bit2 calib_mode,
+                            // bit3 motors_enabled, bit4 remote_allowed
+    int32_t  err;           // 0 ok, 1 bad args, 2 remote disabled,
+                            // 3 not connected, 4 clamped
+    uint32_t reserved;
+    double   pan_deg, tilt_deg;
+    double   pan_min, pan_max, tilt_min, tilt_max;
+    double   reserved2[3];
+};
+#pragma pack(pop)
+static_assert(sizeof(GcCommandPacket) == 128, "GcCommandPacket must be 128 bytes");
+static_assert(sizeof(GcStatusPacket)  == 96,  "GcStatusPacket must be 96 bytes");
+
+enum GcCommand : uint16_t {
+    GC_CMD_PING        = 0,
+    GC_CMD_SET_ANGLES  = 1,
+    GC_CMD_CALIB_MODE  = 2,
+    GC_CMD_SET_CALIB   = 3,
+    GC_CMD_SAVE_CONFIG = 4,
+    GC_CMD_STOP        = 5,
+};
+
+static sock_t g_ctrl_sock      = BAD_SOCK;
+static int    g_ctrl_port      = 5006;
+static bool   g_ctrl_enabled   = true;    // listener on at launch (persisted)
+static bool   g_remote_allowed = true;    // gates motion/config commands (persisted)
+static bool   g_calib_mode     = false;   // suppresses target-stream aiming
+static double g_ctrl_last_recv = 0.0;
+static uint64_t g_ctrl_count   = 0;
+
+static void ctrl_stop() {
+    if (g_ctrl_sock == BAD_SOCK) return;
+#ifdef _WIN32
+    closesocket(g_ctrl_sock); WSACleanup();
+#else
+    close(g_ctrl_sock);
+#endif
+    g_ctrl_sock = BAD_SOCK;
+    g_calib_mode = false;
+}
+
+static void ctrl_start(int port) {
+    if (g_ctrl_sock != BAD_SOCK) return;
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { g_status = "ctrl: WSAStartup failed"; return; }
+#endif
+    sock_t s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == BAD_SOCK) { g_status = "ctrl: socket failed"; return; }
+    // nonblocking: drained on the UI thread each frame
+#ifdef _WIN32
+    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+#else
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+#endif
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
+        g_status = "ctrl: bind failed (port in use?)";
+#ifdef _WIN32
+        closesocket(s); WSACleanup();
+#else
+        close(s);
+#endif
+        return;
+    }
+    g_ctrl_sock = s;
+    g_status = "ctrl: listening on UDP " + std::to_string(port);
+}
+
+static MotorAxis* targeting_axis(int idx) {
+    return (idx >= 0 && idx < (int)g_axes.size()) ? &g_axes[idx] : nullptr;
+}
+
+// Absolute move of one targeting axis to a displayed-frame angle, clamped to
+// its travel limits. Returns true if the command had to be clamped.
+static bool ctrl_move_axis(MotorAxis& m, double angle_deg) {
+    double lo = m.pos_min_deg, hi = m.pos_max_deg;
+    bool clamped = angle_deg < lo || angle_deg > hi;
+    double a_deg = angle_deg < lo ? lo : (angle_deg > hi ? hi : angle_deg);
+    float v = std::min(m.velocity, m.max_velocity);
+    float a = std::min(m.accel, m.max_accel);
+    motor_try("ctrl move", [&] { m.axis->MoveSCurve(a_deg + m.zero_ref, v, a, a, m.jerk_pct); });
+    return clamped;
+}
+
+static GcStatusPacket ctrl_make_status(uint16_t cmd, uint32_t seq, int32_t err) {
+    GcStatusPacket rep;
+    memset(&rep, 0, sizeof(rep));
+    rep.magic[0] = 'G'; rep.magic[1] = 'C'; rep.magic[2] = 'S'; rep.magic[3] = '1';
+    rep.version = 1;
+    rep.cmd = cmd;
+    rep.seq = seq;
+    rep.err = err;
+
+    MotorAxis* pan  = targeting_axis(g_tgt.pan_axis);
+    MotorAxis* tilt = targeting_axis(g_tgt.tilt_axis);
+    bool connected = g_controller != nullptr && pan != nullptr && tilt != nullptr;
+    bool in_pos = false, enabled = false;
+    if (connected) {
+        // cached readback refreshed by gui_draw_axis each frame
+        rep.pan_deg  = pan->actual_position  - pan->zero_ref;
+        rep.tilt_deg = tilt->actual_position - tilt->zero_ref;
+        rep.pan_min  = pan->pos_min_deg;  rep.pan_max  = pan->pos_max_deg;
+        rep.tilt_min = tilt->pos_min_deg; rep.tilt_max = tilt->pos_max_deg;
+        enabled = pan->amp_enabled && tilt->amp_enabled;
+        in_pos  = enabled &&
+                  pan->state  == RSIState::RSIStateIDLE &&
+                  tilt->state == RSIState::RSIStateIDLE;
+    }
+    rep.flags = (err == 0 ? 0x01 : 0x00) |
+                (in_pos ? 0x02 : 0x00) |
+                (g_calib_mode ? 0x04 : 0x00) |
+                (enabled ? 0x08 : 0x00) |
+                (g_remote_allowed ? 0x10 : 0x00);
+    return rep;
+}
+
+// Executes one command; returns the reply err code.
+static int32_t ctrl_dispatch(const GcCommandPacket& pkt) {
+    MotorAxis* pan  = targeting_axis(g_tgt.pan_axis);
+    MotorAxis* tilt = targeting_axis(g_tgt.tilt_axis);
+    bool connected = g_controller != nullptr && pan != nullptr && tilt != nullptr;
+
+    switch (pkt.cmd) {
+        case GC_CMD_PING:
+            return 0;
+        case GC_CMD_STOP:
+            // always allowed -- it's the safe direction
+            if (!connected) return 3;
+            motor_try("ctrl stop", [&] { pan->axis->Abort(); });
+            motor_try("ctrl stop", [&] { tilt->axis->Abort(); });
+            return 0;
+        case GC_CMD_SET_ANGLES: {
+            if (!g_remote_allowed) return 2;
+            if (!connected) return 3;
+            bool clamped = ctrl_move_axis(*pan, pkt.args[0]);
+            clamped     |= ctrl_move_axis(*tilt, pkt.args[1]);
+            return clamped ? 4 : 0;
+        }
+        case GC_CMD_CALIB_MODE:
+            if (!g_remote_allowed) return 2;
+            g_calib_mode = pkt.args[0] != 0.0;
+            return 0;
+        case GC_CMD_SET_CALIB:
+            if (!g_remote_allowed) return 2;
+            g_tgt.base[0]     = (float)pkt.args[0];
+            g_tgt.base[1]     = (float)pkt.args[1];
+            g_tgt.base[2]     = (float)pkt.args[2];
+            g_tgt.rot[0]      = (float)pkt.args[3];
+            g_tgt.rot[1]      = (float)pkt.args[4];
+            g_tgt.rot[2]      = (float)pkt.args[5];
+            g_tgt.pan_sign    = (float)pkt.args[6];
+            g_tgt.pan_scale   = (float)pkt.args[7];
+            g_tgt.pan_offset  = (float)pkt.args[8];
+            g_tgt.tilt_sign   = (float)pkt.args[9];
+            g_tgt.tilt_scale  = (float)pkt.args[10];
+            g_tgt.tilt_offset = (float)pkt.args[11];
+            return 0;
+        case GC_CMD_SAVE_CONFIG:
+            if (!g_remote_allowed) return 2;
+            config_save();
+            return 0;
+        default:
+            return 1;
+    }
+}
+
+// Drain pending commands (a few per frame is plenty at 2 Hz polls + button
+// presses) and reply to each sender. Also expires calib mode on silence.
+static void ctrl_poll() {
+    if (g_ctrl_sock == BAD_SOCK) {
+        return;
+    }
+    for (int i = 0; i < 8; i++) {
+        GcCommandPacket pkt;
+        sockaddr_in from;
+#ifdef _WIN32
+        int fromlen = (int)sizeof(from);
+#else
+        socklen_t fromlen = sizeof(from);
+#endif
+        int n = (int)recvfrom(g_ctrl_sock, (char*)&pkt, sizeof(pkt), 0,
+                              (sockaddr*)&from, &fromlen);
+        if (n != (int)sizeof(pkt) ||
+            pkt.magic[0] != 'G' || pkt.magic[1] != 'C' || pkt.magic[2] != 'C' ||
+            pkt.magic[3] != '1' || pkt.version != 1) {
+            break; // no (valid) packet waiting
+        }
+        g_ctrl_last_recv = glfwGetTime();
+        g_ctrl_count++;
+        int32_t err = ctrl_dispatch(pkt);
+        GcStatusPacket rep = ctrl_make_status(pkt.cmd, pkt.seq, err);
+        sendto(g_ctrl_sock, (const char*)&rep, sizeof(rep), 0,
+               (sockaddr*)&from, fromlen);
+    }
+    // dead-man switch: the sender polls at 2 Hz, so 5s of silence means it's
+    // gone -- drop back to normal aiming rather than staying paused forever
+    if (g_calib_mode && glfwGetTime() - g_ctrl_last_recv > 5.0) {
+        g_calib_mode = false;
+        g_status = "ctrl: calib mode expired (no control traffic)";
+    }
+}
 
 // ---------------------------------------------------------------------------
 // config file (persists zeros + tunables next to the exe)
@@ -379,6 +632,12 @@ static void config_load_globals() {
     g_tgt.base[0]     = (float)cfg_get("tgt_base_x", g_tgt.base[0]);
     g_tgt.base[1]     = (float)cfg_get("tgt_base_y", g_tgt.base[1]);
     g_tgt.base[2]     = (float)cfg_get("tgt_base_z", g_tgt.base[2]);
+    g_tgt.rot[0]      = (float)cfg_get("tgt_rot_x", g_tgt.rot[0]);
+    g_tgt.rot[1]      = (float)cfg_get("tgt_rot_y", g_tgt.rot[1]);
+    g_tgt.rot[2]      = (float)cfg_get("tgt_rot_z", g_tgt.rot[2]);
+    g_ctrl_port       = (int)  cfg_get("ctrl_port", g_ctrl_port);
+    g_ctrl_enabled    = cfg_get("ctrl_enabled", g_ctrl_enabled ? 1 : 0) != 0.0;
+    g_remote_allowed  = cfg_get("remote_allowed", g_remote_allowed ? 1 : 0) != 0.0;
     g_tgt.pan_axis    = (int)  cfg_get("tgt_pan_axis", g_tgt.pan_axis);
     g_tgt.tilt_axis   = (int)  cfg_get("tgt_tilt_axis", g_tgt.tilt_axis);
     g_tgt.pan_sign    = (float)cfg_get("tgt_pan_sign", g_tgt.pan_sign);
@@ -414,6 +673,12 @@ static void config_save() {
     f << "tgt_base_x=" << g_tgt.base[0] << "\n";
     f << "tgt_base_y=" << g_tgt.base[1] << "\n";
     f << "tgt_base_z=" << g_tgt.base[2] << "\n";
+    f << "tgt_rot_x=" << g_tgt.rot[0] << "\n";
+    f << "tgt_rot_y=" << g_tgt.rot[1] << "\n";
+    f << "tgt_rot_z=" << g_tgt.rot[2] << "\n";
+    f << "ctrl_port=" << g_ctrl_port << "\n";
+    f << "ctrl_enabled=" << (g_ctrl_enabled ? 1 : 0) << "\n";
+    f << "remote_allowed=" << (g_remote_allowed ? 1 : 0) << "\n";
     f << "tgt_pan_axis=" << g_tgt.pan_axis << "\n";
     f << "tgt_tilt_axis=" << g_tgt.tilt_axis << "\n";
     f << "tgt_pan_sign=" << g_tgt.pan_sign << "\n";
@@ -591,10 +856,32 @@ static void gui_draw() {
             }
             ImGui::Checkbox("aim at network target", &g_net_aim);
 
-            // re-aim BOTH axes at ~30 Hz; a valid network target takes priority over the test circle
+            // control channel (request/reply, orange commands angles / uploads calibration)
+            ImGui::SeparatorText("Control channel (UDP request/reply)");
+            bool ctrl_on = g_ctrl_sock != BAD_SOCK;
+            if (ctrl_on) ImGui::BeginDisabled();
+            ImGui::InputInt("control port", &g_ctrl_port);
+            if (ctrl_on) ImGui::EndDisabled();
+            if (ImGui::Checkbox("control channel", &ctrl_on)) {
+                if (ctrl_on) ctrl_start(g_ctrl_port); else ctrl_stop();
+                g_ctrl_enabled = g_ctrl_sock != BAD_SOCK;
+                config_save();
+            }
+            if (ImGui::Checkbox("allow remote control (moves + calibration)", &g_remote_allowed)) {
+                config_save();
+            }
+            {
+                double age = (g_ctrl_count > 0) ? (glfwGetTime() - g_ctrl_last_recv) : -1.0;
+                ImGui::Text("rx %llu cmds  age %.2fs  %s",
+                            (unsigned long long)g_ctrl_count, age,
+                            g_calib_mode ? "CALIB MODE (target aiming paused)" : "");
+            }
+
+            // re-aim BOTH axes at ~30 Hz; a valid network target takes priority over the test
+            // circle. Suppressed in calib mode so remote SET_ANGLES moves aren't fought.
             static double last_t = 0.0;
             double now = glfwGetTime();
-            if (now - last_t >= 0.033) {
+            if (now - last_t >= 0.033 && !g_calib_mode) {
                 if (g_net_aim && g_net_running) {
                     float tgt[3]; bool valid;
                     { std::lock_guard<std::mutex> lk(g_net_mutex);
@@ -608,7 +895,9 @@ static void gui_draw() {
             }
 
             if (ImGui::TreeNode("Targeting calibration")) {
+                ImGui::TextDisabled("Filled by orange's calibration upload; hand-edit only for bench tests.");
                 ImGui::InputFloat3("base pos (world)", g_tgt.base);
+                ImGui::InputFloat3("rot xyz (deg)", g_tgt.rot);
                 ImGui::InputInt("pan axis",  &g_tgt.pan_axis);
                 ImGui::InputInt("tilt axis", &g_tgt.tilt_axis);
                 ImGui::InputFloat("pan sign",    &g_tgt.pan_sign);
@@ -683,14 +972,17 @@ int main() {
     ImGui_ImplOpenGL2_Init();
 
     startup_connect();   // auto-connect + clear faults + enable on startup
+    if (g_ctrl_enabled) ctrl_start(g_ctrl_port);
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+        ctrl_poll();
         create_new_frame();
         gui_draw();
         render_a_frame(window);
     }
 
+    ctrl_stop();
     net_stop();
     for (MotorAxis& m : g_axes) {
         motor_try("shutdown", [&] {

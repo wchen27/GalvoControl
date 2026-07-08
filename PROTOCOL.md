@@ -52,3 +52,60 @@ so any rate up to ~1 kHz is fine and higher gives no benefit. Don't flood the li
 ## Versioning
 Bump `version` for incompatible changes. The receiver validates magic + version and ignores
 mismatches, so a version skew fails safe (no motion) rather than misinterpreting bytes.
+
+---
+
+# Control Channel (GCC1 / GCS1)
+
+Request/reply UDP channel on **port 5006** (configurable), used by orange to query
+status, command raw mirror angles, toggle calib mode, and upload fitted calibration
+parameters. The GCT1 target stream above is unchanged. Little-endian, packed, fixed
+sizes; datagrams with the wrong size/magic/version are ignored (fail-safe).
+
+The sender retries a request (same `seq`) after ~250 ms, up to 4 tries. Commands are
+idempotent, so duplicate delivery is harmless. Every reply carries full status.
+
+## GCC1 command (orange -> GalvoControl), 128 bytes
+| off | size | type    | field    | meaning |
+|-----|------|---------|----------|---------|
+| 0   | 4    | char[4] | magic    | `'G','C','C','1'` |
+| 4   | 2    | uint16  | version  | = **1** |
+| 6   | 2    | uint16  | cmd      | see below |
+| 8   | 4    | uint32  | seq      | echoed in the reply |
+| 12  | 4    | uint32  | reserved | 0 |
+| 16  | 112  | f64[14] | args     | per-command |
+
+| cmd | name        | args |
+|-----|-------------|------|
+| 0   | PING        | - (status query; keepalive for calib mode) |
+| 1   | SET_ANGLES  | `[0]`=pan, `[1]`=tilt - displayed motor degrees; clamped to travel limits (err=4 if clamped) |
+| 2   | CALIB_MODE  | `[0]` = 0/1 |
+| 3   | SET_CALIB   | `[0..2]`=base xyz mm, `[3..5]`=rot Euler XYZ deg (R=Rz*Ry*Rx, world->galvo), `[6..8]`=pan sign/scale/offset, `[9..11]`=tilt sign/scale/offset |
+| 4   | SAVE_CONFIG | - (persist current config to motor_control.cfg) |
+| 5   | STOP        | - (abort the pan/tilt axes; always allowed) |
+
+## GCS1 reply (GalvoControl -> orange), 96 bytes
+| off | size | type    | field     | meaning |
+|-----|------|---------|-----------|---------|
+| 0   | 4    | char[4] | magic     | `'G','C','S','1'` |
+| 4   | 2    | uint16  | version   | = **1** |
+| 6   | 2    | uint16  | cmd       | echoed |
+| 8   | 4    | uint32  | seq       | echoed |
+| 12  | 4    | uint32  | flags     | bit0 ok, bit1 in_position, bit2 calib_mode, bit3 motors_enabled, bit4 remote_allowed |
+| 16  | 4    | int32   | err       | 0 ok, 1 bad args, 2 remote disabled, 3 not connected, 4 clamped |
+| 20  | 4    | uint32  | reserved  | 0 |
+| 24  | 8    | f64     | pan_deg   | current, displayed frame |
+| 32  | 8    | f64     | tilt_deg  | current, displayed frame |
+| 40  | 32   | f64[4]  | limits    | pan_min, pan_max, tilt_min, tilt_max (deg) |
+| 72  | 24   | f64[3]  | reserved  | 0 |
+
+## Semantics
+- **Remote gating:** motion/config commands require the app's "allow remote control"
+  checkbox; refused with err=2 otherwise. PING and STOP always work.
+- **Calib mode:** while on, GCT1 target aiming and the test circle are suppressed so
+  remote SET_ANGLES moves aren't fought. Auto-expires after **5 s** without control
+  traffic (the sender's 2 Hz status poll is the keepalive) - a dead sender can't
+  leave the unit paused.
+- **in_position:** both targeting axes IDLE with amps enabled.
+- **Angles** are in the displayed motor frame (raw minus the persisted zero_ref) -
+  the same frame shown in the UI and used by the calibration fit.
