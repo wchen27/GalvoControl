@@ -589,6 +589,16 @@ static std::atomic<bool>  g_filt_on{true};
 static std::atomic<float> g_filt_min_cutoff{1.5f}; // Hz: smoothing at rest
 static std::atomic<float> g_filt_beta{0.3f};       // cutoff gain per deg/s of goal rate
 
+// World-space target tracker: dead-reckons on the packet velocity every
+// iteration (inherently smooth) and blends each measurement in over
+// track_tau instead of snapping to it. Without this, every arriving packet
+// steps the goal by the innovation (triangulation noise + prediction error,
+// both larger when the object moves / blurs) and the mirrors chase each
+// step at full authority -- image jitter at camera frame rate, exactly when
+// the One Euro goal filter has opened up to pass the motion.
+static std::atomic<float> g_track_tau_ms{40.0f};
+static std::atomic<float> g_hud_innov_mm{0.0f}; // live |measurement - tracker|
+
 // ---------------------------------------------------------------------------
 // tracking thread (~500 Hz) + step-response test. Motor calls are serialized
 // with the UI thread by g_motor_mutex (inside motor_try).
@@ -710,6 +720,8 @@ static void track_thread_loop() {
     bool was = false;
     OneEuro filt_pan, filt_tilt;         // goal-angle filters (thread-local)
     double ff_pan_lp = 0.0, ff_tilt_lp = 0.0;
+    bool trk_init = false;               // world-space tracker state
+    double trk[3] = {0.0, 0.0, 0.0};
     while (g_track_thread_run.load()) {
         auto t0 = clk::now();
         double dt = std::chrono::duration<double>(t0 - prev).count();
@@ -723,6 +735,7 @@ static void track_thread_loop() {
             filt_pan.reset();
             filt_tilt.reset();
             ff_pan_lp = ff_tilt_lp = 0.0;
+            trk_init = false;
             continue;
         }
 
@@ -754,9 +767,30 @@ static void track_thread_loop() {
                 // term is capped so a stream hiccup can't fling the mirrors
                 double ex = age_send + std::min(link_age, 0.2) +
                             (double)g_servo_lead_ms.load() * 1e-3;
-                float tgt[3] = { pos[0] + (float)(vel[0] * ex),
-                                 pos[1] + (float)(vel[1] * ex),
-                                 pos[2] + (float)(vel[2] * ex) };
+                double meas[3] = { pos[0] + vel[0] * ex,
+                                   pos[1] + vel[1] * ex,
+                                   pos[2] + vel[2] * ex };
+                // world-space tracker: advance smoothly on velocity, blend
+                // the measurement in over track_tau instead of snapping --
+                // packet-rate innovation steps never reach the mirrors
+                double innov = sqrt((meas[0] - trk[0]) * (meas[0] - trk[0]) +
+                                    (meas[1] - trk[1]) * (meas[1] - trk[1]) +
+                                    (meas[2] - trk[2]) * (meas[2] - trk[2]));
+                if (!trk_init || innov > 500.0) {
+                    // first target or a genuine re-acquisition jump: snap
+                    trk[0] = meas[0]; trk[1] = meas[1]; trk[2] = meas[2];
+                    trk_init = true;
+                    innov = 0.0;
+                } else {
+                    double tau = std::max(1e-3, (double)g_track_tau_ms.load() * 1e-3);
+                    double k = std::min(1.0, dt / tau);
+                    for (int i = 0; i < 3; i++) {
+                        trk[i] += vel[i] * dt;            // dead reckoning
+                        trk[i] += k * (meas[i] - trk[i]); // gentle correction
+                    }
+                }
+                g_hud_innov_mm.store((float)innov);
+                float tgt[3] = { (float)trk[0], (float)trk[1], (float)trk[2] };
                 PanTilt pt = targeting_solve(tgt);
                 goal_pan = pt.pan_motor; goal_tilt = pt.tilt_motor;
                 double sp2 = (double)vel[0]*vel[0] + vel[1]*vel[1] + vel[2]*vel[2];
@@ -773,6 +807,8 @@ static void track_thread_loop() {
                 g_hud_link_ms.store((float)(link_age * 1e3));
                 g_hud_extrap_ms.store((float)((age_send + std::min(link_age, 0.2)) * 1e3 +
                                               g_servo_lead_ms.load()));
+            } else {
+                trk_init = false;   // target lost: don't blend across the gap
             }
             if (g_filt_on.load()) {
                 // One Euro on the goals: kills target-noise buzz at rest,
@@ -804,6 +840,7 @@ static void track_thread_loop() {
             filt_pan.reset();
             filt_tilt.reset();
             ff_pan_lp = ff_tilt_lp = 0.0;
+            trk_init = false;
         }
         std::this_thread::sleep_until(t0 + std::chrono::milliseconds(10));
     }
@@ -1358,6 +1395,7 @@ static void config_load_globals() {
     g_filt_on         = cfg_get("filt_on", g_filt_on ? 1 : 0) != 0.0;
     g_filt_min_cutoff = (float)cfg_get("filt_min_cutoff", g_filt_min_cutoff.load());
     g_filt_beta       = (float)cfg_get("filt_beta", g_filt_beta.load());
+    g_track_tau_ms    = (float)cfg_get("track_tau_ms", g_track_tau_ms.load());
     g_xyjog_rot       = (int)  cfg_get("xyjog_rot", g_xyjog_rot);
     g_xyjog_step      = (float)cfg_get("xyjog_step", g_xyjog_step);
     g_xyjog_pan_sign  = (float)cfg_get("xyjog_pan_sign", g_xyjog_pan_sign);
@@ -1436,6 +1474,7 @@ static void config_save() {
     f << "filt_on=" << (g_filt_on ? 1 : 0) << "\n";
     f << "filt_min_cutoff=" << g_filt_min_cutoff.load() << "\n";
     f << "filt_beta=" << g_filt_beta.load() << "\n";
+    f << "track_tau_ms=" << g_track_tau_ms.load() << "\n";
     f << "xyjog_rot=" << g_xyjog_rot << "\n";
     f << "xyjog_step=" << g_xyjog_step << "\n";
     f << "xyjog_pan_sign=" << g_xyjog_pan_sign << "\n";
@@ -1674,12 +1713,21 @@ static void gui_draw() {
                         ImGui::SameLine();
                         ImGui::TextDisabled("(lower cutoff = calmer at rest; higher beta = faster on real motion)");
                     }
+                    float tau = g_track_tau_ms.load();
+                    ImGui::SetNextItemWidth(100.0f);
+                    if (ImGui::InputFloat("target smooth tau (ms)", &tau)) {
+                        g_track_tau_ms.store(std::max(1.0f, tau));
+                        config_save();
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(measurement blend time; raise if a MOVING target jitters, lower if corrections feel laggy)");
                 }
                 // latency HUD, fed by the tracking thread
                 ImGui::Text("hud: rx %.0f Hz  sender age %.1f ms  link %.1f ms  extrap %.1f ms  "
-                            "err pan %+.3f tilt %+.3f deg",
+                            "innov %.1f mm  err pan %+.3f tilt %+.3f deg",
                             g_net_rate.load(), g_hud_age_send_ms.load(), g_hud_link_ms.load(),
-                            g_hud_extrap_ms.load(), g_hud_err_pan.load(), g_hud_err_tilt.load());
+                            g_hud_extrap_ms.load(), g_hud_innov_mm.load(),
+                            g_hud_err_pan.load(), g_hud_err_tilt.load());
             }
 
             // step-response test (instrumentation): square wave on both axes,
