@@ -334,14 +334,14 @@ static float g_target[3]     = {0.0f, 0.0f, 1000.0f};
 static bool  g_moving_target = false;
 static float g_net_max_step  = 15.0f;   // max pan/tilt change per aim update (deg): slew guard (discrete mode)
 
-// Network-target tracking mode. Velocity pursuit (default) runs a P controller
-// on position error with MoveVelocity every frame: unlike repeated MoveSCurve
-// point-to-point moves -- which each plan to STOP at the goal, capping the
-// sustainable speed of a short segment at sqrt(d*a) -- it holds whatever
-// velocity the target demands (up to the axis limits), so a fast mover
-// doesn't outrun the mirrors.
+// Network-target tracking mode. Velocity pursuit (default) commands
+// MoveVelocity every frame with a TIME-OPTIMAL law: full max_velocity toward
+// the goal, braking only on the max-accel curve (v = sqrt(2*a*d)). No
+// smoothing anywhere -- speed is the priority; the per-axis max velocity /
+// max accel fields are the only limits. (Repeated MoveSCurve point-to-point
+// moves each plan to STOP at the goal, capping a short segment at sqrt(d*a),
+// which is why a fast mover outruns that mode.)
 static bool  g_track_velocity = true;
-static float g_track_kp       = 8.0f;   // 1/s: err (deg) -> commanded deg/s
 static bool  g_track_was      = false;  // velocity pursuit active last frame
 
 struct PanTilt { double pan_motor, tilt_motor, az, el; };
@@ -405,18 +405,26 @@ static PanTilt targeting_solve(const float* target) {
     return pt;
 }
 
-// Velocity pursuit: one P-control step toward displayed-frame goal angles.
-// Uses MoveVelocity (like the joystick jog), re-issued every frame.
+// Velocity pursuit: one time-optimal step toward displayed-frame goal angles.
+// Uses MoveVelocity (like the joystick jog), re-issued every frame: full
+// speed toward the goal, braking on the max-accel curve. Overshoot guards:
+// 0.8 margin on the braking curve (the loop only updates at frame rate), a
+// per-update crossing cap, and a small deadband so it doesn't hunt at rest.
 static void track_velocity_step(double goal_pan, double goal_tilt) {
     auto vcmd = [&](int idx, double goal) {
         if (idx < 0 || idx >= (int)g_axes.size()) return;
         MotorAxis& m = g_axes[idx];
         goal = std::min((double)m.pos_max_deg, std::max((double)m.pos_min_deg, goal));
-        double err = goal - (m.actual_position - m.zero_ref);
-        double v = (double)g_track_kp * err;
-        double vmax = (double)m.max_velocity;
-        v = std::min(vmax, std::max(-vmax, v));
-        float a = std::min(m.accel, m.max_accel);
+        double err  = goal - (m.actual_position - m.zero_ref);
+        double aerr = fabs(err);
+        double a    = (double)m.max_accel;
+        double v    = 0.0;
+        if (aerr > 0.02) {                       // deadband (deg)
+            v = sqrt(2.0 * a * aerr * 0.8);      // brake curve, with margin
+            v = std::min(v, aerr * 60.0);        // don't cross the goal in one ~16ms update
+            v = std::min(v, (double)m.max_velocity);
+            if (err < 0.0) v = -v;
+        }
         motor_try("track", [&] { m.axis->MoveVelocity(v, a); });
     };
     vcmd(g_tgt.pan_axis,  goal_pan);
@@ -427,8 +435,7 @@ static void track_velocity_stop() {
     auto stop = [&](int idx) {
         if (idx < 0 || idx >= (int)g_axes.size()) return;
         MotorAxis& m = g_axes[idx];
-        float a = std::min(m.accel, m.max_accel);
-        motor_try("track stop", [&] { m.axis->MoveVelocity(0.0, a); });
+        motor_try("track stop", [&] { m.axis->MoveVelocity(0.0, m.max_accel); });
     };
     stop(g_tgt.pan_axis);
     stop(g_tgt.tilt_axis);
@@ -974,7 +981,6 @@ static void config_load_globals() {
     g_xf.scale  = (float)cfg_get("xf_scale", g_xf.scale);
     g_net_max_step = (float)cfg_get("net_max_step", g_net_max_step);
     g_track_velocity = cfg_get("track_velocity", g_track_velocity ? 1 : 0) != 0.0;
-    g_track_kp       = (float)cfg_get("track_kp", g_track_kp);
     g_xyjog_rot       = (int)  cfg_get("xyjog_rot", g_xyjog_rot);
     g_xyjog_step      = (float)cfg_get("xyjog_step", g_xyjog_step);
     g_xyjog_pan_sign  = (float)cfg_get("xyjog_pan_sign", g_xyjog_pan_sign);
@@ -1049,7 +1055,6 @@ static void config_save() {
     f << "xf_scale=" << g_xf.scale << "\n";
     f << "net_max_step=" << g_net_max_step << "\n";
     f << "track_velocity=" << (g_track_velocity ? 1 : 0) << "\n";
-    f << "track_kp=" << g_track_kp << "\n";
     f << "xyjog_rot=" << g_xyjog_rot << "\n";
     f << "xyjog_step=" << g_xyjog_step << "\n";
     f << "xyjog_pan_sign=" << g_xyjog_pan_sign << "\n";
@@ -1258,10 +1263,8 @@ static void gui_draw() {
             ImGui::SameLine();
             if (ImGui::Checkbox("velocity pursuit", &g_track_velocity)) { config_save(); }
             if (g_track_velocity) {
-                ImGui::SetNextItemWidth(100.0f);
-                if (ImGui::InputFloat("tracking kp (1/s)", &g_track_kp)) { config_save(); }
-                ImGui::SameLine();
-                ImGui::TextDisabled("(higher = tighter; too high oscillates)");
+                ImGui::TextDisabled("time-optimal: full speed, brakes at max accel -- raise the "
+                                    "per-axis max velocity / max accel to go faster");
             }
 
             // control channel (request/reply, orange commands angles / uploads calibration)
