@@ -29,6 +29,7 @@
 #include <unistd.h>
 #endif
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 
@@ -92,7 +93,24 @@ struct MotorAxis {
 // ---------------------------------------------------------------------------
 static MotionController*      g_controller = nullptr;
 static std::vector<MotorAxis> g_axes;
-static std::string            g_status = "not connected";
+
+// status line, written from the UI / net / control / tracking threads
+static std::mutex  g_status_mutex;
+static std::string g_status = "not connected";
+static void status_set(const std::string& s) {
+    std::lock_guard<std::mutex> lk(g_status_mutex);
+    g_status = s;
+}
+static std::string status_get() {
+    std::lock_guard<std::mutex> lk(g_status_mutex);
+    return g_status;
+}
+
+// Serializes ALL RapidCode access: the tracking thread commands motors
+// concurrently with the UI thread (every call site goes through motor_try).
+// Recursive because motor_connect's guarded body calls motor_apply_limits,
+// which guards again.
+static std::recursive_mutex g_motor_mutex;
 
 // ---------------------------------------------------------------------------
 // network target receiver (UDP, one-way Linux -> Windows). See PROTOCOL.md.
@@ -107,8 +125,23 @@ struct GcTargetPacket {
     uint64_t timestamp_ns;  // sender timestamp (ns), informational
     double   x, y, z;       // world coordinates, mm
 };
+// v2 adds velocity + the sender's measured capture->send age, so the
+// receiver can extrapolate the target to its own aim time.
+struct GcTargetPacketV2 {
+    char     magic[4];      // 'G','C','T','1'
+    uint16_t version;       // = 2
+    uint16_t flags;         // bit0 = target valid
+    uint32_t seq;
+    uint32_t target_id;
+    uint64_t timestamp_ns;
+    double   x, y, z;       // world mm, at CAPTURE time
+    double   vx, vy, vz;    // world mm/s
+    uint32_t age_us;        // capture -> send latency measured by the sender
+    uint32_t reserved;
+};
 #pragma pack(pop)
 static_assert(sizeof(GcTargetPacket) == 48, "GcTargetPacket must be 48 bytes");
+static_assert(sizeof(GcTargetPacketV2) == 80, "GcTargetPacketV2 must be 80 bytes");
 
 #ifdef _WIN32
 typedef SOCKET sock_t;
@@ -122,9 +155,13 @@ static std::atomic<bool> g_net_running{false};
 static std::thread       g_net_thread;
 static std::mutex        g_net_mutex;
 static int      g_net_port = 5005;
-static bool     g_net_aim  = false;   // aim at received targets
+static std::atomic<bool>  g_net_aim{false};  // aim at received targets (read by tracking thread)
+static std::atomic<float> g_net_rate{0.0f};  // packets/sec, for the HUD
 // shared under g_net_mutex:
 static float    g_net_target[3] = {0.0f, 0.0f, 1000.0f};
+static float    g_net_vel[3]    = {0.0f, 0.0f, 0.0f};   // mm/s (v2; zero for v1)
+static double   g_net_age_send  = 0.0;                  // s, sender capture->send (v2)
+static std::chrono::steady_clock::time_point g_net_t_recv; // arrival time
 static bool     g_net_valid     = false;
 static uint32_t g_net_seq       = 0;
 static uint32_t g_net_id        = 0;
@@ -134,10 +171,10 @@ static double   g_net_last_recv = 0.0;
 static void net_recv_loop(int port) {
 #ifdef _WIN32
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { g_status = "net: WSAStartup failed"; g_net_running = false; return; }
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { status_set("net: WSAStartup failed"); g_net_running = false; return; }
 #endif
     sock_t s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s == BAD_SOCK) { g_status = "net: socket failed"; g_net_running = false; return; }
+    if (s == BAD_SOCK) { status_set("net: socket failed"); g_net_running = false; return; }
 #ifdef _WIN32
     DWORD to = 200; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
 #else
@@ -149,7 +186,7 @@ static void net_recv_loop(int port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
     if (bind(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
-        g_status = "net: bind failed (port in use?)";
+        status_set("net: bind failed (port in use?)");
 #ifdef _WIN32
         closesocket(s); WSACleanup();
 #else
@@ -158,26 +195,49 @@ static void net_recv_loop(int port) {
         g_net_running = false;
         return;
     }
-    g_status = "net: listening on UDP " + std::to_string(port);
+    status_set("net: listening on UDP " + std::to_string(port));
 
-    GcTargetPacket pkt;
+    char buf[128];
+    uint32_t rate_count = 0;
+    auto rate_t0 = std::chrono::steady_clock::now();
     while (g_net_running) {
-        int n = (int)recvfrom(s, (char*)&pkt, sizeof(pkt), 0, nullptr, nullptr);
-        if (n == (int)sizeof(pkt) &&
-            pkt.magic[0] == 'G' && pkt.magic[1] == 'C' && pkt.magic[2] == 'T' && pkt.magic[3] == '1' &&
-            pkt.version == 1) {
+        int n = (int)recvfrom(s, buf, sizeof(buf), 0, nullptr, nullptr);
+        bool v1 = n == (int)sizeof(GcTargetPacket);
+        bool v2 = n == (int)sizeof(GcTargetPacketV2);
+        if ((v1 || v2) && buf[0] == 'G' && buf[1] == 'C' && buf[2] == 'T' && buf[3] == '1') {
+            const GcTargetPacket*   p1 = (const GcTargetPacket*)buf;
+            const GcTargetPacketV2* p2 = (const GcTargetPacketV2*)buf;
+            if ((v1 && p1->version != 1) || (v2 && p2->version != 2)) continue;
             std::lock_guard<std::mutex> lk(g_net_mutex);
             // accept the first packet, then only newer sequence numbers (int32 diff => wraps ok)
-            if (g_net_count == 0 || (int32_t)(pkt.seq - g_net_seq) > 0) {
-                g_net_seq       = pkt.seq;
-                g_net_id        = pkt.target_id;
-                g_net_valid     = (pkt.flags & 0x1) != 0;
-                g_net_target[0] = (float)pkt.x;
-                g_net_target[1] = (float)pkt.y;
-                g_net_target[2] = (float)pkt.z;
+            if (g_net_count == 0 || (int32_t)(p1->seq - g_net_seq) > 0) {
+                g_net_seq       = p1->seq;
+                g_net_id        = p1->target_id;
+                g_net_valid     = (p1->flags & 0x1) != 0;
+                g_net_target[0] = (float)p1->x;
+                g_net_target[1] = (float)p1->y;
+                g_net_target[2] = (float)p1->z;
+                if (v2) {
+                    g_net_vel[0]   = (float)p2->vx;
+                    g_net_vel[1]   = (float)p2->vy;
+                    g_net_vel[2]   = (float)p2->vz;
+                    g_net_age_send = p2->age_us * 1e-6;
+                } else {
+                    g_net_vel[0] = g_net_vel[1] = g_net_vel[2] = 0.0f;
+                    g_net_age_send = 0.0;
+                }
+                g_net_t_recv    = std::chrono::steady_clock::now();
                 g_net_count++;
                 g_net_last_recv = glfwGetTime();
+                rate_count++;
             }
+        }
+        auto now = std::chrono::steady_clock::now();
+        double win = std::chrono::duration<double>(now - rate_t0).count();
+        if (win >= 1.0) {
+            g_net_rate.store((float)(rate_count / win));
+            rate_count = 0;
+            rate_t0 = now;
         }
     }
 #ifdef _WIN32
@@ -203,10 +263,11 @@ static void net_stop() {
 // ---------------------------------------------------------------------------
 template <class Fn>
 static void motor_try(const char* what, Fn&& fn) {
+    std::lock_guard<std::recursive_mutex> lk(g_motor_mutex);
     try {
         fn();
     } catch (const RsiError& e) {
-        g_status = std::string(what) + ": " + e.what();
+        status_set(std::string(what) + ": " + e.what());
     }
 }
 
@@ -251,7 +312,7 @@ static void motor_connect() {
             ? MotionController::CreateFromSoftware(rtaPath)
             : MotionController::CreateFromSoftware();
         if (g_controller == nullptr) {
-            g_status = "CreateFromSoftware returned null";
+            status_set("CreateFromSoftware returned null");
             return;
         }
         g_controller->ThrowExceptions(true);
@@ -267,7 +328,7 @@ static void motor_connect() {
                 msg += "\n  ";
                 msg += g_controller->NetworkLogMessageGet(i);
             }
-            g_status = msg;
+            status_set(msg);
             return;
         }
 
@@ -282,7 +343,7 @@ static void motor_connect() {
             motor_apply_limits(m);
             g_axes.push_back(m);
         }
-        g_status = "connected: " + std::to_string(count) + " axes";
+        status_set("connected: " + std::to_string(count) + " axes");
     });
 }
 
@@ -334,15 +395,27 @@ static float g_target[3]     = {0.0f, 0.0f, 1000.0f};
 static bool  g_moving_target = false;
 static float g_net_max_step  = 15.0f;   // max pan/tilt change per aim update (deg): slew guard (discrete mode)
 
-// Network-target tracking mode. Velocity pursuit (default) commands
-// MoveVelocity every frame with a TIME-OPTIMAL law: full max_velocity toward
-// the goal, braking only on the max-accel curve (v = sqrt(2*a*d)). No
-// smoothing anywhere -- speed is the priority; the per-axis max velocity /
-// max accel fields are the only limits. (Repeated MoveSCurve point-to-point
+// Network-target tracking mode. Velocity pursuit (default) runs on a
+// DEDICATED ~500 Hz thread (not the vsynced GUI thread) with a TIME-OPTIMAL
+// law: full max_velocity toward the goal, braking only on the max-accel
+// curve (v = sqrt(2*a*d)), plus goal-rate feed-forward from the v2 packet
+// velocity so a constant-speed target is ridden with ~zero chase error. The
+// target is extrapolated to aim time each iteration (sender age + link age +
+// servo lead). No smoothing anywhere -- the per-axis max velocity / max
+// accel fields are the only limits. (Repeated MoveSCurve point-to-point
 // moves each plan to STOP at the goal, capping a short segment at sqrt(d*a),
 // which is why a fast mover outruns that mode.)
-static bool  g_track_velocity = true;
-static bool  g_track_was      = false;  // velocity pursuit active last frame
+static std::atomic<bool>  g_track_velocity{true};
+static std::atomic<float> g_servo_lead_ms{15.0f}; // receiver+servo residual lead
+// declared here (used by the tracking thread); owned by the control channel
+static std::atomic<bool> g_calib_mode{false}; // suppresses target-stream aiming
+
+// HUD (written by the tracking thread)
+static std::atomic<float> g_hud_age_send_ms{0.0f};
+static std::atomic<float> g_hud_link_ms{0.0f};
+static std::atomic<float> g_hud_extrap_ms{0.0f};
+static std::atomic<float> g_hud_err_pan{0.0f};
+static std::atomic<float> g_hud_err_tilt{0.0f};
 
 struct PanTilt { double pan_motor, tilt_motor, az, el; };
 
@@ -418,9 +491,14 @@ static PanTilt targeting_solve(const float* target) {
 // controller means braking starts degrees too late every cycle -> a large
 // sustained oscillation. The commanded position is fresh and deterministic;
 // the drive's inner loop owns converging the encoder to it.
-static void track_velocity_step(double goal_pan, double goal_tilt, double dt) {
+// ff_pan/ff_tilt: goal angular rate (deg/s) feed-forward -- added on top of
+// the correction so a constant-rate goal is tracked with ~zero steady-state
+// error (the brake curve alone needs err = w^2/(1.6a) to sustain rate w).
+static void track_velocity_step(double goal_pan, double goal_tilt, double dt,
+                                double ff_pan, double ff_tilt) {
     double inv_dt = 1.0 / std::max(dt, 1e-3);
-    auto vcmd = [&](int idx, double goal) {
+    auto vcmd = [&](int idx, double goal, double ff,
+                    std::atomic<float>& hud_err) {
         if (idx < 0 || idx >= (int)g_axes.size()) return;
         MotorAxis& m = g_axes[idx];
         goal = std::min((double)m.pos_max_deg, std::max((double)m.pos_min_deg, goal));
@@ -429,19 +507,21 @@ static void track_velocity_step(double goal_pan, double goal_tilt, double dt) {
         motor_try("track pos", [&] { pos = m.axis->CommandPositionGet(); pos_ok = true; });
         if (!pos_ok) return;   // never command velocity off a failed read
         double err  = goal - (pos - m.zero_ref);
+        hud_err.store((float)err);
         double aerr = fabs(err);
         double a    = (double)m.max_accel;
-        double v    = 0.0;
-        if (aerr > 0.02) {                       // deadband (deg)
-            v = sqrt(2.0 * a * aerr * 0.8);      // brake curve, with margin
-            v = std::min(v, aerr * inv_dt);      // don't cross the goal in one update
-            v = std::min(v, (double)m.max_velocity);
-            if (err < 0.0) v = -v;
+        double corr = 0.0;
+        if (aerr > 0.02) {                          // deadband (deg)
+            corr = sqrt(2.0 * a * aerr * 0.8);      // brake curve, with margin
+            corr = std::min(corr, aerr * inv_dt);   // don't cross the goal in one update
+            if (err < 0.0) corr = -corr;
         }
+        double vmax = (double)m.max_velocity;
+        double v = std::min(vmax, std::max(-vmax, ff + corr));
         motor_try("track", [&] { m.axis->MoveVelocity(v, a); });
     };
-    vcmd(g_tgt.pan_axis,  goal_pan);
-    vcmd(g_tgt.tilt_axis, goal_tilt);
+    vcmd(g_tgt.pan_axis,  goal_pan,  ff_pan,  g_hud_err_pan);
+    vcmd(g_tgt.tilt_axis, goal_tilt, ff_tilt, g_hud_err_tilt);
 }
 
 static void track_velocity_stop() {
@@ -452,6 +532,190 @@ static void track_velocity_stop() {
     };
     stop(g_tgt.pan_axis);
     stop(g_tgt.tilt_axis);
+}
+
+// ---------------------------------------------------------------------------
+// tracking thread (~500 Hz) + step-response test. Motor calls are serialized
+// with the UI thread by g_motor_mutex (inside motor_try).
+// ---------------------------------------------------------------------------
+static std::thread       g_track_thread;
+static std::atomic<bool> g_track_thread_run{false};
+
+// step test: square wave on both axes, logged at every control iteration
+static std::atomic<bool> g_step_request{false};
+static std::atomic<bool> g_step_running{false};
+static float g_step_amp    = 5.0f;  // deg (edit only while not running)
+static float g_step_period = 0.5f;  // s per half-cycle
+static int   g_step_cycles = 4;
+
+struct StepRow { double t, goal, cmd_pan, act_pan, cmd_tilt, act_tilt; };
+
+static void aim_pan_tilt(double pan_disp, double tilt_disp); // defined below
+
+// Rise time (to 90% of the step) + overshoot, averaged over edges, from the
+// command trajectory of one axis.
+static void step_stats(const std::vector<StepRow>& rows, bool pan,
+                       double amp, double period, double& rise_ms,
+                       double& overshoot_pct) {
+    double rise_sum = 0.0, over_max = 0.0;
+    int rise_n = 0;
+    double edge_t = -1.0, edge_goal = 0.0, prev_goal = 0.0;
+    bool risen = false;
+    for (const StepRow& r : rows) {
+        double cmd = pan ? r.cmd_pan : r.cmd_tilt;
+        if (r.goal != prev_goal) {          // new edge
+            edge_t = r.t; edge_goal = r.goal; risen = false;
+            prev_goal = r.goal;
+        }
+        if (edge_t < 0.0) continue;
+        double step_size = 2.0 * amp;
+        if (!risen && fabs(cmd - edge_goal) < 0.1 * step_size) {
+            rise_sum += (r.t - edge_t) * 1e3; rise_n++; risen = true;
+        }
+        if (risen) {
+            double over = (cmd - edge_goal) * (edge_goal > 0 ? 1.0 : -1.0);
+            over_max = std::max(over_max, over / step_size * 100.0);
+        }
+        (void)period;
+    }
+    rise_ms = rise_n > 0 ? rise_sum / rise_n : -1.0;
+    overshoot_pct = over_max;
+}
+
+static void run_step_test() {
+    using clk = std::chrono::steady_clock;
+    float amp = g_step_amp, period = g_step_period;
+    int cycles = g_step_cycles;
+    g_step_running = true;
+    status_set("step test: running...");
+
+    std::vector<StepRow> rows;
+    rows.reserve((size_t)(cycles * period * 2.0 * 500.0) + 16);
+    auto t0 = clk::now();
+    auto prev = t0;
+    double total = cycles * period * 2.0;
+    while (g_track_thread_run.load()) {
+        auto now = clk::now();
+        double t = std::chrono::duration<double>(now - t0).count();
+        if (t >= total) break;
+        double dt = std::chrono::duration<double>(now - prev).count();
+        prev = now;
+        dt = std::min(std::max(dt, 1e-4), 0.05);
+
+        double goal = (fmod(t, 2.0 * period) < period) ? amp : -amp;
+        track_velocity_step(goal, goal, dt, 0.0, 0.0);
+
+        StepRow row{t, goal, 0, 0, 0, 0};
+        auto read_axis = [&](int idx, double& cmd, double& act) {
+            if (idx < 0 || idx >= (int)g_axes.size()) return;
+            MotorAxis& m = g_axes[idx];
+            motor_try("step read", [&] {
+                cmd = m.axis->CommandPositionGet() - m.zero_ref;
+                act = m.axis->ActualPositionGet()  - m.zero_ref;
+            });
+        };
+        read_axis(g_tgt.pan_axis,  row.cmd_pan,  row.act_pan);
+        read_axis(g_tgt.tilt_axis, row.cmd_tilt, row.act_tilt);
+        rows.push_back(row);
+
+        std::this_thread::sleep_until(now + std::chrono::milliseconds(2));
+    }
+    track_velocity_stop();
+    aim_pan_tilt(0.0, 0.0);   // park at home
+
+    std::ofstream f("step_test.csv");
+    if (f) {
+        f << "t,goal,cmd_pan,act_pan,cmd_tilt,act_tilt\n";
+        for (const StepRow& r : rows) {
+            f << r.t << "," << r.goal << "," << r.cmd_pan << "," << r.act_pan
+              << "," << r.cmd_tilt << "," << r.act_tilt << "\n";
+        }
+    }
+    double rise_p, over_p, rise_t, over_t;
+    step_stats(rows, true,  amp, period, rise_p, over_p);
+    step_stats(rows, false, amp, period, rise_t, over_t);
+    status_set("step test done (" + std::to_string(rows.size()) +
+               " rows -> step_test.csv): pan rise " + std::to_string(rise_p) +
+               " ms over " + std::to_string(over_p) + "%, tilt rise " +
+               std::to_string(rise_t) + " ms over " + std::to_string(over_t) +
+               "%");
+    g_step_running = false;
+}
+
+static void track_thread_loop() {
+    using clk = std::chrono::steady_clock;
+    auto prev = clk::now();
+    bool was = false;
+    while (g_track_thread_run.load()) {
+        auto t0 = clk::now();
+        double dt = std::chrono::duration<double>(t0 - prev).count();
+        prev = t0;
+        dt = std::min(std::max(dt, 1e-4), 0.05);
+
+        if (g_step_request.exchange(false) && g_controller != nullptr) {
+            run_step_test();
+            prev = clk::now();
+            was = false;
+            continue;
+        }
+
+        bool active = g_controller != nullptr && g_net_aim.load() &&
+                      g_net_running.load() && !g_calib_mode.load() &&
+                      g_track_velocity.load();
+        if (active) {
+            float pos[3], vel[3];
+            bool valid;
+            double age_send;
+            clk::time_point trecv;
+            uint64_t count;
+            {
+                std::lock_guard<std::mutex> lk(g_net_mutex);
+                pos[0] = g_net_target[0]; pos[1] = g_net_target[1]; pos[2] = g_net_target[2];
+                vel[0] = g_net_vel[0];    vel[1] = g_net_vel[1];    vel[2] = g_net_vel[2];
+                valid = g_net_valid;
+                age_send = g_net_age_send;
+                trecv = g_net_t_recv;
+                count = g_net_count;
+            }
+            if (count == 0) valid = false;
+            double link_age = std::chrono::duration<double>(t0 - trecv).count();
+            if (link_age > 1.0) valid = false;   // sender gone -> home
+
+            double goal_pan = 0.0, goal_tilt = 0.0, ff_pan = 0.0, ff_tilt = 0.0;
+            if (valid) {
+                // extrapolate the capture-time position to aim time; the link
+                // term is capped so a stream hiccup can't fling the mirrors
+                double ex = age_send + std::min(link_age, 0.2) +
+                            (double)g_servo_lead_ms.load() * 1e-3;
+                float tgt[3] = { pos[0] + (float)(vel[0] * ex),
+                                 pos[1] + (float)(vel[1] * ex),
+                                 pos[2] + (float)(vel[2] * ex) };
+                PanTilt pt = targeting_solve(tgt);
+                goal_pan = pt.pan_motor; goal_tilt = pt.tilt_motor;
+                double sp2 = (double)vel[0]*vel[0] + vel[1]*vel[1] + vel[2]*vel[2];
+                if (sp2 > 1.0) {   // >1 mm/s: numeric goal-rate feed-forward
+                    const double eps = 0.02; // s
+                    float tgt2[3] = { tgt[0] + (float)(vel[0] * eps),
+                                      tgt[1] + (float)(vel[1] * eps),
+                                      tgt[2] + (float)(vel[2] * eps) };
+                    PanTilt p2 = targeting_solve(tgt2);
+                    ff_pan  = (p2.pan_motor  - pt.pan_motor)  / eps;
+                    ff_tilt = (p2.tilt_motor - pt.tilt_motor) / eps;
+                }
+                g_hud_age_send_ms.store((float)(age_send * 1e3));
+                g_hud_link_ms.store((float)(link_age * 1e3));
+                g_hud_extrap_ms.store((float)((age_send + std::min(link_age, 0.2)) * 1e3 +
+                                              g_servo_lead_ms.load()));
+            }
+            track_velocity_step(goal_pan, goal_tilt, dt, ff_pan, ff_tilt);
+            was = true;
+        } else if (was) {
+            track_velocity_stop();
+            was = false;
+        }
+        std::this_thread::sleep_until(t0 + std::chrono::milliseconds(2));
+    }
+    if (was) track_velocity_stop();
 }
 
 // Command explicit displayed pan/tilt angles, each clamped to its axis's travel range.
@@ -602,7 +866,7 @@ static bool cal_fit_affine(const float base[3], double panc[3], double tiltc[3],
 
 static bool cal_fit() {
     int n = (int)g_cal_points.size();
-    if (n < 3) { g_status = "cal: need >= 3 points"; return false; }
+    if (n < 3) { status_set("cal: need >= 3 points"); return false; }
 
     // The affine az/el -> pan/tilt model is only exact when `base` is the true turret
     // rotation center. A wrong base injects a curved (parallax) residual that a plane
@@ -666,7 +930,7 @@ static bool cal_fit() {
 
     // commit the winning base + its affine fit (recompute for the raw, un-regularized RMS)
     if (!cal_fit_affine(best, panc, tiltc, sse, saz, sel)) {
-        g_status = "cal: singular - vary azimuth AND elevation (points lie on a line in az/el)";
+        status_set("cal: singular - vary azimuth AND elevation (points lie on a line in az/el)");
         return false;
     }
     g_tgt.base[0] = best[0]; g_tgt.base[1] = best[1]; g_tgt.base[2] = best[2];
@@ -674,10 +938,10 @@ static bool cal_fit() {
     g_cal_std_az = saz; g_cal_std_el = sel;
     g_cal_rms = sqrt(sse / (2.0 * n));
     g_cal_active = true;
-    g_status = "cal: RMS " + std::to_string(g_cal_rms) + " deg" +
+    status_set("cal: RMS " + std::to_string(g_cal_rms) + " deg" +
                (g_cal_base_solved ? " (base solved)" : "") +
                "  (az spread " + std::to_string(g_cal_std_az) +
-               ", el spread " + std::to_string(g_cal_std_el) + ")";
+               ", el spread " + std::to_string(g_cal_std_el) + ")");
     return true;
 }
 
@@ -701,7 +965,7 @@ static void cal_capture_tick() {
             cp.tilt = g_axes[g_tgt.tilt_axis].actual_position - g_axes[g_tgt.tilt_axis].zero_ref;
         g_cal_points.push_back(cp);
         g_capturing = false;
-        g_status = "cal: captured point " + std::to_string(g_cal_points.size());
+        status_set("cal: captured point " + std::to_string(g_cal_points.size()));
     }
 }
 
@@ -755,7 +1019,7 @@ static sock_t g_ctrl_sock      = BAD_SOCK;
 static int    g_ctrl_port      = 5006;
 static bool   g_ctrl_enabled   = true;    // listener on at launch (persisted)
 static bool   g_remote_allowed = true;    // gates motion/config commands (persisted)
-static bool   g_calib_mode     = false;   // suppresses target-stream aiming
+// (g_calib_mode is declared with the tracking globals above)
 static double g_ctrl_last_recv = 0.0;
 static uint64_t g_ctrl_count   = 0;
 
@@ -774,10 +1038,10 @@ static void ctrl_start(int port) {
     if (g_ctrl_sock != BAD_SOCK) return;
 #ifdef _WIN32
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { g_status = "ctrl: WSAStartup failed"; return; }
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { status_set("ctrl: WSAStartup failed"); return; }
 #endif
     sock_t s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s == BAD_SOCK) { g_status = "ctrl: socket failed"; return; }
+    if (s == BAD_SOCK) { status_set("ctrl: socket failed"); return; }
     // nonblocking: drained on the UI thread each frame
 #ifdef _WIN32
     u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
@@ -790,7 +1054,7 @@ static void ctrl_start(int port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
     if (bind(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
-        g_status = "ctrl: bind failed (port in use?)";
+        status_set("ctrl: bind failed (port in use?)");
 #ifdef _WIN32
         closesocket(s); WSACleanup();
 #else
@@ -799,7 +1063,7 @@ static void ctrl_start(int port) {
         return;
     }
     g_ctrl_sock = s;
-    g_status = "ctrl: listening on UDP " + std::to_string(port);
+    status_set("ctrl: listening on UDP " + std::to_string(port));
 }
 
 static MotorAxis* targeting_axis(int idx) {
@@ -940,7 +1204,7 @@ static void ctrl_poll() {
     // gone -- drop back to normal aiming rather than staying paused forever
     if (g_calib_mode && glfwGetTime() - g_ctrl_last_recv > 5.0) {
         g_calib_mode = false;
-        g_status = "ctrl: calib mode expired (no control traffic)";
+        status_set("ctrl: calib mode expired (no control traffic)");
     }
 }
 
@@ -994,6 +1258,7 @@ static void config_load_globals() {
     g_xf.scale  = (float)cfg_get("xf_scale", g_xf.scale);
     g_net_max_step = (float)cfg_get("net_max_step", g_net_max_step);
     g_track_velocity = cfg_get("track_velocity", g_track_velocity ? 1 : 0) != 0.0;
+    g_servo_lead_ms  = (float)cfg_get("servo_lead_ms", g_servo_lead_ms.load());
     g_xyjog_rot       = (int)  cfg_get("xyjog_rot", g_xyjog_rot);
     g_xyjog_step      = (float)cfg_get("xyjog_step", g_xyjog_step);
     g_xyjog_pan_sign  = (float)cfg_get("xyjog_pan_sign", g_xyjog_pan_sign);
@@ -1068,6 +1333,7 @@ static void config_save() {
     f << "xf_scale=" << g_xf.scale << "\n";
     f << "net_max_step=" << g_net_max_step << "\n";
     f << "track_velocity=" << (g_track_velocity ? 1 : 0) << "\n";
+    f << "servo_lead_ms=" << g_servo_lead_ms.load() << "\n";
     f << "xyjog_rot=" << g_xyjog_rot << "\n";
     f << "xyjog_step=" << g_xyjog_step << "\n";
     f << "xyjog_pan_sign=" << g_xyjog_pan_sign << "\n";
@@ -1224,7 +1490,7 @@ static void gui_draw() {
             ImGui::SameLine();
             if (ImGui::Button("Save Settings")) { config_save(); }
         }
-        ImGui::TextWrapped("Status: %s", g_status.c_str());
+        ImGui::TextWrapped("Status: %s", status_get().c_str());
 
         if (g_controller != nullptr) {
             cal_capture_tick();
@@ -1272,12 +1538,47 @@ static void gui_draw() {
                 ImGui::Text("  solves to: az %.1f el %.1f  ->  pan %.1f tilt %.1f",
                             npt.az, npt.el, npt.pan_motor, npt.tilt_motor);
             }
-            ImGui::Checkbox("aim at network target", &g_net_aim);
-            ImGui::SameLine();
-            if (ImGui::Checkbox("velocity pursuit", &g_track_velocity)) { config_save(); }
-            if (g_track_velocity) {
-                ImGui::TextDisabled("time-optimal: full speed, brakes at max accel -- raise the "
-                                    "per-axis max velocity / max accel to go faster");
+            {
+                bool aim = g_net_aim.load();
+                if (ImGui::Checkbox("aim at network target", &aim)) g_net_aim.store(aim);
+                ImGui::SameLine();
+                bool tv = g_track_velocity.load();
+                if (ImGui::Checkbox("velocity pursuit", &tv)) { g_track_velocity.store(tv); config_save(); }
+            }
+            if (g_track_velocity.load()) {
+                ImGui::TextDisabled("time-optimal on a 500 Hz thread: full speed, brakes at max "
+                                    "accel -- raise the per-axis max velocity / max accel to go faster");
+                float lead = g_servo_lead_ms.load();
+                ImGui::SetNextItemWidth(150.0f);
+                if (ImGui::SliderFloat("servo lead (ms)", &lead, 0.0f, 100.0f)) {
+                    g_servo_lead_ms.store(lead);
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("(receiver+servo share of prediction; sender age is automatic)");
+                // latency HUD, fed by the tracking thread
+                ImGui::Text("hud: rx %.0f Hz  sender age %.1f ms  link %.1f ms  extrap %.1f ms  "
+                            "err pan %+.3f tilt %+.3f deg",
+                            g_net_rate.load(), g_hud_age_send_ms.load(), g_hud_link_ms.load(),
+                            g_hud_extrap_ms.load(), g_hud_err_pan.load(), g_hud_err_tilt.load());
+            }
+
+            // step-response test (instrumentation): square wave on both axes,
+            // logged per control iteration to step_test.csv next to the exe
+            ImGui::SeparatorText("Step test (instrumentation)");
+            {
+                bool busy = g_step_running.load();
+                if (busy) ImGui::BeginDisabled();
+                ImGui::SetNextItemWidth(80.0f);
+                ImGui::InputFloat("amp (deg)", &g_step_amp);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80.0f);
+                ImGui::InputFloat("half-period (s)", &g_step_period);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(60.0f);
+                ImGui::InputInt("cycles", &g_step_cycles);
+                if (ImGui::Button("Run step test")) { g_step_request.store(true); }
+                if (busy) ImGui::EndDisabled();
+                if (busy) ImGui::TextColored(ImVec4(1, 1, 0, 1), "step test running...");
             }
 
             // control channel (request/reply, orange commands angles / uploads calibration)
@@ -1301,46 +1602,38 @@ static void gui_draw() {
                             g_calib_mode ? "CALIB MODE (target aiming paused)" : "");
             }
 
-            // network-target aiming. Suppressed in calib mode so remote
-            // SET_ANGLES moves aren't fought.
-            bool net_tracking = g_net_aim && g_net_running && !g_calib_mode;
-            double goal_pan = 0.0, goal_tilt = 0.0;   // no valid target -> home (0,0)
-            if (net_tracking) {
-                float tgt[3]; bool valid;
-                { std::lock_guard<std::mutex> lk(g_net_mutex);
-                  tgt[0] = g_net_target[0]; tgt[1] = g_net_target[1]; tgt[2] = g_net_target[2];
-                  valid = g_net_valid; }
-                if (valid) {
-                    PanTilt pt = targeting_solve(tgt);
-                    goal_pan = pt.pan_motor; goal_tilt = pt.tilt_motor;
-                }
-            }
+            // network-target aiming. Velocity pursuit lives on the dedicated
+            // tracking thread; the GUI thread only runs the discrete fallback
+            // (velocity pursuit off) and the moving-target test circle.
+            // Suppressed in calib mode so remote SET_ANGLES moves aren't
+            // fought.
+            bool net_tracking = g_net_aim.load() && g_net_running && !g_calib_mode.load();
+            bool thread_owns  = net_tracking && g_track_velocity.load();
             static double last_t = 0.0;
             double now = glfwGetTime();
-            if (net_tracking && g_track_velocity) {
-                // velocity pursuit: every frame, no throttle
-                static double prev_step_t = 0.0;
-                double dt = (prev_step_t > 0.0) ? now - prev_step_t : 0.016;
-                dt = std::min(std::max(dt, 1e-3), 0.1);
-                prev_step_t = now;
-                track_velocity_step(goal_pan, goal_tilt, dt);
-                g_track_was = true;
-            } else {
-                if (g_track_was) { track_velocity_stop(); g_track_was = false; }
-                // discrete fallback: slew-limited point-to-point re-aim at ~30 Hz
-                if (now - last_t >= 0.033 && !g_calib_mode) {
-                    if (net_tracking) {
-                        static double cur_pan = 0.0, cur_tilt = 0.0; static bool have = false;
-                        if (!have) { cur_pan = goal_pan; cur_tilt = goal_tilt; have = true; }
-                        double s = (double)g_net_max_step;   // slew cap per update
-                        cur_pan  += std::min(s, std::max(-s, goal_pan  - cur_pan));
-                        cur_tilt += std::min(s, std::max(-s, goal_tilt - cur_tilt));
-                        aim_pan_tilt(cur_pan, cur_tilt);
-                    } else if (g_moving_target && !g_calib_mode) {
-                        targeting_aim(g_target);
+            if (!thread_owns && !g_step_running.load() &&
+                now - last_t >= 0.033 && !g_calib_mode.load()) {
+                if (net_tracking) {
+                    double goal_pan = 0.0, goal_tilt = 0.0;   // no valid target -> home (0,0)
+                    float tgt[3]; bool valid;
+                    { std::lock_guard<std::mutex> lk(g_net_mutex);
+                      tgt[0] = g_net_target[0]; tgt[1] = g_net_target[1]; tgt[2] = g_net_target[2];
+                      valid = g_net_valid; }
+                    if (valid) {
+                        PanTilt pt = targeting_solve(tgt);
+                        goal_pan = pt.pan_motor; goal_tilt = pt.tilt_motor;
                     }
-                    last_t = now;
+                    // discrete fallback: slew-limited point-to-point re-aim
+                    static double cur_pan = 0.0, cur_tilt = 0.0; static bool have = false;
+                    if (!have) { cur_pan = goal_pan; cur_tilt = goal_tilt; have = true; }
+                    double s = (double)g_net_max_step;   // slew cap per update
+                    cur_pan  += std::min(s, std::max(-s, goal_pan  - cur_pan));
+                    cur_tilt += std::min(s, std::max(-s, goal_tilt - cur_tilt));
+                    aim_pan_tilt(cur_pan, cur_tilt);
+                } else if (g_moving_target) {
+                    targeting_aim(g_target);
                 }
+                last_t = now;
             }
 
             if (ImGui::TreeNode("Targeting calibration")) {
@@ -1512,6 +1805,8 @@ int main() {
 
     startup_connect();   // auto-connect + clear faults + enable on startup
     if (g_ctrl_enabled) ctrl_start(g_ctrl_port);
+    g_track_thread_run = true;
+    g_track_thread = std::thread(track_thread_loop);
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -1521,6 +1816,8 @@ int main() {
         render_a_frame(window);
     }
 
+    g_track_thread_run = false;   // stop tracking before disabling the axes
+    if (g_track_thread.joinable()) g_track_thread.join();
     ctrl_stop();
     net_stop();
     for (MotorAxis& m : g_axes) {

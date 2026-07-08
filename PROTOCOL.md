@@ -46,12 +46,32 @@ The sender transmits to the receiver's IP on port 5005. The app binds `INADDR_AN
   6–8 unit array (each unit filters on its id).
 
 ## Rate
-Send at your source rate (e.g. camera fps). The receiver aims at ~30 Hz using the latest packet,
-so any rate up to ~1 kHz is fine and higher gives no benefit. Don't flood the link.
+Send at your source rate (e.g. camera fps). The receiver's tracking thread aims at ~500 Hz using
+the latest packet, extrapolated to aim time, so any rate up to ~1 kHz is fine. Don't flood the link.
+
+## Version 2 packet — 80 bytes (preferred for tracking)
+Same magic; `version = 2`. Adds velocity + the sender's measured pipeline age so the
+**receiver** extrapolates the target to its own aim time (each control iteration uses
+`pos + vel * (age_us + time-since-arrival + servo lead)`), absorbing inference-time
+variance and receiver-side queueing that a fixed sender-side lead cannot.
+
+| off | size | type    | field         | meaning |
+|-----|------|---------|---------------|---------|
+| 0   | 24   | —       | header        | identical to v1 (magic, version=**2**, flags, seq, target_id, timestamp_ns) |
+| 24  | 24   | f64[3]  | x, y, z       | world mm at **capture** time (not extrapolated) |
+| 48  | 24   | f64[3]  | vx, vy, vz    | target velocity, world mm/s (EMA-smoothed by the sender) |
+| 72  | 4    | uint32  | age_us        | sender's measured capture→send latency, µs |
+| 76  | 4    | uint32  | reserved      | 0 |
+
+The receiver accepts both sizes: a 48-byte v1 packet behaves as before (velocity 0, age 0).
+Receiver safety: the arrival-age term of the extrapolation is capped (~200 ms), and a target
+whose last packet is >1 s old is treated as invalid (return to home) — a dead sender cannot
+run the mirrors away along a stale velocity.
 
 ## Versioning
-Bump `version` for incompatible changes. The receiver validates magic + version and ignores
-mismatches, so a version skew fails safe (no motion) rather than misinterpreting bytes.
+Bump `version` for incompatible changes. The receiver validates magic + version (and exact
+size) and ignores mismatches, so a version skew fails safe (no motion) rather than
+misinterpreting bytes.
 
 ---
 
