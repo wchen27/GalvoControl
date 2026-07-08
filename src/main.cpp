@@ -332,7 +332,17 @@ static CoordXform g_xf;
 
 static float g_target[3]     = {0.0f, 0.0f, 1000.0f};
 static bool  g_moving_target = false;
-static float g_net_max_step  = 15.0f;   // max pan/tilt change per aim update (deg): slew guard
+static float g_net_max_step  = 15.0f;   // max pan/tilt change per aim update (deg): slew guard (discrete mode)
+
+// Network-target tracking mode. Velocity pursuit (default) runs a P controller
+// on position error with MoveVelocity every frame: unlike repeated MoveSCurve
+// point-to-point moves -- which each plan to STOP at the goal, capping the
+// sustainable speed of a short segment at sqrt(d*a) -- it holds whatever
+// velocity the target demands (up to the axis limits), so a fast mover
+// doesn't outrun the mirrors.
+static bool  g_track_velocity = true;
+static float g_track_kp       = 8.0f;   // 1/s: err (deg) -> commanded deg/s
+static bool  g_track_was      = false;  // velocity pursuit active last frame
 
 struct PanTilt { double pan_motor, tilt_motor, az, el; };
 
@@ -393,6 +403,35 @@ static PanTilt targeting_solve(const float* target) {
         pt.tilt_motor = g_tgt.tilt_sign * el * g_tgt.tilt_scale + g_tgt.tilt_offset;
     }
     return pt;
+}
+
+// Velocity pursuit: one P-control step toward displayed-frame goal angles.
+// Uses MoveVelocity (like the joystick jog), re-issued every frame.
+static void track_velocity_step(double goal_pan, double goal_tilt) {
+    auto vcmd = [&](int idx, double goal) {
+        if (idx < 0 || idx >= (int)g_axes.size()) return;
+        MotorAxis& m = g_axes[idx];
+        goal = std::min((double)m.pos_max_deg, std::max((double)m.pos_min_deg, goal));
+        double err = goal - (m.actual_position - m.zero_ref);
+        double v = (double)g_track_kp * err;
+        double vmax = (double)m.max_velocity;
+        v = std::min(vmax, std::max(-vmax, v));
+        float a = std::min(m.accel, m.max_accel);
+        motor_try("track", [&] { m.axis->MoveVelocity(v, a); });
+    };
+    vcmd(g_tgt.pan_axis,  goal_pan);
+    vcmd(g_tgt.tilt_axis, goal_tilt);
+}
+
+static void track_velocity_stop() {
+    auto stop = [&](int idx) {
+        if (idx < 0 || idx >= (int)g_axes.size()) return;
+        MotorAxis& m = g_axes[idx];
+        float a = std::min(m.accel, m.max_accel);
+        motor_try("track stop", [&] { m.axis->MoveVelocity(0.0, a); });
+    };
+    stop(g_tgt.pan_axis);
+    stop(g_tgt.tilt_axis);
 }
 
 // Command explicit displayed pan/tilt angles, each clamped to its axis's travel range.
@@ -934,6 +973,8 @@ static void config_load_globals() {
     g_xf.sgn[2] = (float)cfg_get("xf_sgn2", g_xf.sgn[2]);
     g_xf.scale  = (float)cfg_get("xf_scale", g_xf.scale);
     g_net_max_step = (float)cfg_get("net_max_step", g_net_max_step);
+    g_track_velocity = cfg_get("track_velocity", g_track_velocity ? 1 : 0) != 0.0;
+    g_track_kp       = (float)cfg_get("track_kp", g_track_kp);
     g_xyjog_rot       = (int)  cfg_get("xyjog_rot", g_xyjog_rot);
     g_xyjog_step      = (float)cfg_get("xyjog_step", g_xyjog_step);
     g_xyjog_pan_sign  = (float)cfg_get("xyjog_pan_sign", g_xyjog_pan_sign);
@@ -1007,6 +1048,8 @@ static void config_save() {
     f << "xf_sgn2=" << g_xf.sgn[2] << "\n";
     f << "xf_scale=" << g_xf.scale << "\n";
     f << "net_max_step=" << g_net_max_step << "\n";
+    f << "track_velocity=" << (g_track_velocity ? 1 : 0) << "\n";
+    f << "track_kp=" << g_track_kp << "\n";
     f << "xyjog_rot=" << g_xyjog_rot << "\n";
     f << "xyjog_step=" << g_xyjog_step << "\n";
     f << "xyjog_pan_sign=" << g_xyjog_pan_sign << "\n";
@@ -1212,6 +1255,14 @@ static void gui_draw() {
                             npt.az, npt.el, npt.pan_motor, npt.tilt_motor);
             }
             ImGui::Checkbox("aim at network target", &g_net_aim);
+            ImGui::SameLine();
+            if (ImGui::Checkbox("velocity pursuit", &g_track_velocity)) { config_save(); }
+            if (g_track_velocity) {
+                ImGui::SetNextItemWidth(100.0f);
+                if (ImGui::InputFloat("tracking kp (1/s)", &g_track_kp)) { config_save(); }
+                ImGui::SameLine();
+                ImGui::TextDisabled("(higher = tighter; too high oscillates)");
+            }
 
             // control channel (request/reply, orange commands angles / uploads calibration)
             ImGui::SeparatorText("Control channel (UDP request/reply)");
@@ -1234,31 +1285,42 @@ static void gui_draw() {
                             g_calib_mode ? "CALIB MODE (target aiming paused)" : "");
             }
 
-            // re-aim BOTH axes at ~30 Hz; a valid network target takes priority over the test
-            // circle. Suppressed in calib mode so remote SET_ANGLES moves aren't fought.
+            // network-target aiming. Suppressed in calib mode so remote
+            // SET_ANGLES moves aren't fought.
+            bool net_tracking = g_net_aim && g_net_running && !g_calib_mode;
+            double goal_pan = 0.0, goal_tilt = 0.0;   // no valid target -> home (0,0)
+            if (net_tracking) {
+                float tgt[3]; bool valid;
+                { std::lock_guard<std::mutex> lk(g_net_mutex);
+                  tgt[0] = g_net_target[0]; tgt[1] = g_net_target[1]; tgt[2] = g_net_target[2];
+                  valid = g_net_valid; }
+                if (valid) {
+                    PanTilt pt = targeting_solve(tgt);
+                    goal_pan = pt.pan_motor; goal_tilt = pt.tilt_motor;
+                }
+            }
             static double last_t = 0.0;
             double now = glfwGetTime();
-            if (now - last_t >= 0.033 && !g_calib_mode) {
-                if (g_net_aim && g_net_running) {
-                    float tgt[3]; bool valid;
-                    { std::lock_guard<std::mutex> lk(g_net_mutex);
-                      tgt[0] = g_net_target[0]; tgt[1] = g_net_target[1]; tgt[2] = g_net_target[2];
-                      valid = g_net_valid; }
-                    double goal_pan = 0.0, goal_tilt = 0.0;   // no valid target -> return to home (0,0)
-                    if (valid) {
-                        PanTilt pt = targeting_solve(tgt);
-                        goal_pan = pt.pan_motor; goal_tilt = pt.tilt_motor;
+            if (net_tracking && g_track_velocity) {
+                // velocity pursuit: every frame, no throttle
+                track_velocity_step(goal_pan, goal_tilt);
+                g_track_was = true;
+            } else {
+                if (g_track_was) { track_velocity_stop(); g_track_was = false; }
+                // discrete fallback: slew-limited point-to-point re-aim at ~30 Hz
+                if (now - last_t >= 0.033 && !g_calib_mode) {
+                    if (net_tracking) {
+                        static double cur_pan = 0.0, cur_tilt = 0.0; static bool have = false;
+                        if (!have) { cur_pan = goal_pan; cur_tilt = goal_tilt; have = true; }
+                        double s = (double)g_net_max_step;   // slew cap per update
+                        cur_pan  += std::min(s, std::max(-s, goal_pan  - cur_pan));
+                        cur_tilt += std::min(s, std::max(-s, goal_tilt - cur_tilt));
+                        aim_pan_tilt(cur_pan, cur_tilt);
+                    } else if (g_moving_target && !g_calib_mode) {
+                        targeting_aim(g_target);
                     }
-                    static double cur_pan = 0.0, cur_tilt = 0.0; static bool have = false;
-                    if (!have) { cur_pan = goal_pan; cur_tilt = goal_tilt; have = true; }
-                    double s = (double)g_net_max_step;   // slew cap per update
-                    cur_pan  += std::min(s, std::max(-s, goal_pan  - cur_pan));
-                    cur_tilt += std::min(s, std::max(-s, goal_tilt - cur_tilt));
-                    aim_pan_tilt(cur_pan, cur_tilt);
-                } else if (g_moving_target) {
-                    targeting_aim(g_target);
+                    last_t = now;
                 }
-                last_t = now;
             }
 
             if (ImGui::TreeNode("Targeting calibration")) {
