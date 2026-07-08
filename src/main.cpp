@@ -408,20 +408,33 @@ static PanTilt targeting_solve(const float* target) {
 // Velocity pursuit: one time-optimal step toward displayed-frame goal angles.
 // Uses MoveVelocity (like the joystick jog), re-issued every frame: full
 // speed toward the goal, braking on the max-accel curve. Overshoot guards:
-// 0.8 margin on the braking curve (the loop only updates at frame rate), a
-// per-update crossing cap, and a small deadband so it doesn't hunt at rest.
-static void track_velocity_step(double goal_pan, double goal_tilt) {
+// 0.8 margin on the braking curve, a per-update crossing cap (measured dt),
+// and a small deadband so it doesn't hunt at rest.
+//
+// The loop state MUST be a fresh CommandPositionGet(), not the cached
+// actual_position: that cache is refreshed by gui_draw_axis AFTER this runs
+// (a full frame stale -- v*dt = several degrees at speed) and it contains
+// the drive's following error on top. Feeding either into a full-speed
+// controller means braking starts degrees too late every cycle -> a large
+// sustained oscillation. The commanded position is fresh and deterministic;
+// the drive's inner loop owns converging the encoder to it.
+static void track_velocity_step(double goal_pan, double goal_tilt, double dt) {
+    double inv_dt = 1.0 / std::max(dt, 1e-3);
     auto vcmd = [&](int idx, double goal) {
         if (idx < 0 || idx >= (int)g_axes.size()) return;
         MotorAxis& m = g_axes[idx];
         goal = std::min((double)m.pos_max_deg, std::max((double)m.pos_min_deg, goal));
-        double err  = goal - (m.actual_position - m.zero_ref);
+        double pos = 0.0;
+        bool pos_ok = false;
+        motor_try("track pos", [&] { pos = m.axis->CommandPositionGet(); pos_ok = true; });
+        if (!pos_ok) return;   // never command velocity off a failed read
+        double err  = goal - (pos - m.zero_ref);
         double aerr = fabs(err);
         double a    = (double)m.max_accel;
         double v    = 0.0;
         if (aerr > 0.02) {                       // deadband (deg)
             v = sqrt(2.0 * a * aerr * 0.8);      // brake curve, with margin
-            v = std::min(v, aerr * 60.0);        // don't cross the goal in one ~16ms update
+            v = std::min(v, aerr * inv_dt);      // don't cross the goal in one update
             v = std::min(v, (double)m.max_velocity);
             if (err < 0.0) v = -v;
         }
@@ -1306,7 +1319,11 @@ static void gui_draw() {
             double now = glfwGetTime();
             if (net_tracking && g_track_velocity) {
                 // velocity pursuit: every frame, no throttle
-                track_velocity_step(goal_pan, goal_tilt);
+                static double prev_step_t = 0.0;
+                double dt = (prev_step_t > 0.0) ? now - prev_step_t : 0.016;
+                dt = std::min(std::max(dt, 1e-3), 0.1);
+                prev_step_t = now;
+                track_velocity_step(goal_pan, goal_tilt, dt);
                 g_track_was = true;
             } else {
                 if (g_track_was) { track_velocity_stop(); g_track_was = false; }
