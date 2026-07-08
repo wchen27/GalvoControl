@@ -508,10 +508,12 @@ static void track_velocity_step(double goal_pan, double goal_tilt, double dt,
         if (!pos_ok) return;   // never command velocity off a failed read
         double err  = goal - (pos - m.zero_ref);
         hud_err.store((float)err);
-        double aerr = fabs(err);
+        // soft deadband: the correction ramps continuously to zero instead of
+        // stepping at the boundary (a hard deadband buzzes the mirror)
+        double aerr = fabs(err) - 0.02;
         double a    = (double)m.max_accel;
         double corr = 0.0;
-        if (aerr > 0.02) {                          // deadband (deg)
+        if (aerr > 0.0) {
             corr = sqrt(2.0 * a * aerr * 0.8);      // brake curve, with margin
             corr = std::min(corr, aerr * inv_dt);   // don't cross the goal in one update
             if (err < 0.0) corr = -corr;
@@ -533,6 +535,36 @@ static void track_velocity_stop() {
     stop(g_tgt.pan_axis);
     stop(g_tgt.tilt_axis);
 }
+
+// ---------------------------------------------------------------------------
+// goal filter: One Euro (Casiez et al.) on the commanded angles. Adaptive
+// low-pass whose cutoff rises with the signal's own rate: heavy smoothing
+// while the goal is quasi-static (target noise -> no mirror buzz), opening
+// up as the goal genuinely moves (negligible lag at speed). Runs on the
+// tracking thread; the step test bypasses it so servo measurements stay raw.
+// ---------------------------------------------------------------------------
+struct OneEuro {
+    bool   init = false;
+    double x_prev = 0.0, dx_prev = 0.0;
+    static double alpha(double cutoff_hz, double dt) {
+        double tau = 1.0 / (2.0 * 3.14159265358979 * cutoff_hz);
+        return 1.0 / (1.0 + tau / dt);
+    }
+    double step(double x, double dt, double min_cutoff, double beta,
+                double d_cutoff = 1.0) {
+        if (!init) { init = true; x_prev = x; dx_prev = 0.0; return x; }
+        double dx = (x - x_prev) / dt;
+        dx_prev += alpha(d_cutoff, dt) * (dx - dx_prev);
+        double cutoff = min_cutoff + beta * fabs(dx_prev);
+        x_prev += alpha(cutoff, dt) * (x - x_prev);
+        return x_prev;
+    }
+    void reset() { init = false; }
+};
+
+static std::atomic<bool>  g_filt_on{true};
+static std::atomic<float> g_filt_min_cutoff{1.5f}; // Hz: smoothing at rest
+static std::atomic<float> g_filt_beta{0.3f};       // cutoff gain per deg/s of goal rate
 
 // ---------------------------------------------------------------------------
 // tracking thread (~500 Hz) + step-response test. Motor calls are serialized
@@ -646,6 +678,8 @@ static void track_thread_loop() {
     using clk = std::chrono::steady_clock;
     auto prev = clk::now();
     bool was = false;
+    OneEuro filt_pan, filt_tilt;         // goal-angle filters (thread-local)
+    double ff_pan_lp = 0.0, ff_tilt_lp = 0.0;
     while (g_track_thread_run.load()) {
         auto t0 = clk::now();
         double dt = std::chrono::duration<double>(t0 - prev).count();
@@ -656,6 +690,9 @@ static void track_thread_loop() {
             run_step_test();
             prev = clk::now();
             was = false;
+            filt_pan.reset();
+            filt_tilt.reset();
+            ff_pan_lp = ff_tilt_lp = 0.0;
             continue;
         }
 
@@ -707,11 +744,30 @@ static void track_thread_loop() {
                 g_hud_extrap_ms.store((float)((age_send + std::min(link_age, 0.2)) * 1e3 +
                                               g_servo_lead_ms.load()));
             }
+            if (g_filt_on.load()) {
+                // One Euro on the goals: kills target-noise buzz at rest,
+                // opens up with goal rate so fast motion isn't lagged
+                double mc = (double)g_filt_min_cutoff.load();
+                double be = (double)g_filt_beta.load();
+                goal_pan  = filt_pan.step(goal_pan, dt, mc, be);
+                goal_tilt = filt_tilt.step(goal_tilt, dt, mc, be);
+                // light fixed low-pass on the feed-forward: velocity ripple
+                // shakes the image too, and the position loop corrects any
+                // ff lag this adds
+                double af = OneEuro::alpha(5.0, dt);
+                ff_pan_lp  += af * (ff_pan - ff_pan_lp);
+                ff_tilt_lp += af * (ff_tilt - ff_tilt_lp);
+                ff_pan = ff_pan_lp;
+                ff_tilt = ff_tilt_lp;
+            }
             track_velocity_step(goal_pan, goal_tilt, dt, ff_pan, ff_tilt);
             was = true;
         } else if (was) {
             track_velocity_stop();
             was = false;
+            filt_pan.reset();
+            filt_tilt.reset();
+            ff_pan_lp = ff_tilt_lp = 0.0;
         }
         std::this_thread::sleep_until(t0 + std::chrono::milliseconds(2));
     }
@@ -1259,6 +1315,9 @@ static void config_load_globals() {
     g_net_max_step = (float)cfg_get("net_max_step", g_net_max_step);
     g_track_velocity = cfg_get("track_velocity", g_track_velocity ? 1 : 0) != 0.0;
     g_servo_lead_ms  = (float)cfg_get("servo_lead_ms", g_servo_lead_ms.load());
+    g_filt_on         = cfg_get("filt_on", g_filt_on ? 1 : 0) != 0.0;
+    g_filt_min_cutoff = (float)cfg_get("filt_min_cutoff", g_filt_min_cutoff.load());
+    g_filt_beta       = (float)cfg_get("filt_beta", g_filt_beta.load());
     g_xyjog_rot       = (int)  cfg_get("xyjog_rot", g_xyjog_rot);
     g_xyjog_step      = (float)cfg_get("xyjog_step", g_xyjog_step);
     g_xyjog_pan_sign  = (float)cfg_get("xyjog_pan_sign", g_xyjog_pan_sign);
@@ -1334,6 +1393,9 @@ static void config_save() {
     f << "net_max_step=" << g_net_max_step << "\n";
     f << "track_velocity=" << (g_track_velocity ? 1 : 0) << "\n";
     f << "servo_lead_ms=" << g_servo_lead_ms.load() << "\n";
+    f << "filt_on=" << (g_filt_on ? 1 : 0) << "\n";
+    f << "filt_min_cutoff=" << g_filt_min_cutoff.load() << "\n";
+    f << "filt_beta=" << g_filt_beta.load() << "\n";
     f << "xyjog_rot=" << g_xyjog_rot << "\n";
     f << "xyjog_step=" << g_xyjog_step << "\n";
     f << "xyjog_pan_sign=" << g_xyjog_pan_sign << "\n";
@@ -1555,6 +1617,21 @@ static void gui_draw() {
                 }
                 ImGui::SameLine();
                 ImGui::TextDisabled("(receiver+servo share of prediction; sender age is automatic)");
+                {
+                    bool fon = g_filt_on.load();
+                    if (ImGui::Checkbox("goal filter (One Euro)", &fon)) { g_filt_on.store(fon); config_save(); }
+                    if (fon) {
+                        float mc = g_filt_min_cutoff.load();
+                        float be = g_filt_beta.load();
+                        ImGui::SetNextItemWidth(100.0f);
+                        if (ImGui::InputFloat("min cutoff (Hz)", &mc)) { g_filt_min_cutoff.store(std::max(0.05f, mc)); config_save(); }
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(100.0f);
+                        if (ImGui::InputFloat("speed beta", &be)) { g_filt_beta.store(std::max(0.0f, be)); config_save(); }
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(lower cutoff = calmer at rest; higher beta = faster on real motion)");
+                    }
+                }
                 // latency HUD, fed by the tracking thread
                 ImGui::Text("hud: rx %.0f Hz  sender age %.1f ms  link %.1f ms  extrap %.1f ms  "
                             "err pan %+.3f tilt %+.3f deg",
