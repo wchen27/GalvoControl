@@ -21,6 +21,7 @@
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <timeapi.h>   // timeBeginPeriod (link winmm)
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -491,13 +492,25 @@ static PanTilt targeting_solve(const float* target) {
 // controller means braking starts degrees too late every cycle -> a large
 // sustained oscillation. The commanded position is fresh and deterministic;
 // the drive's inner loop owns converging the encoder to it.
+// Skip redundant MoveVelocity commands: RapidCode motion calls are the
+// expensive part of the loop (they can block toward the firmware sample
+// period, and every call holds the motor mutex the GUI thread also needs).
+// A command is re-sent only when it meaningfully changed, or as a 100 ms
+// keepalive. At rest with a filtered static goal this drops the motion-call
+// rate to ~10 Hz.
+static double g_vcmd_last[2] = {1e30, 1e30};
+static std::chrono::steady_clock::time_point g_vcmd_t[2];
+
 // ff_pan/ff_tilt: goal angular rate (deg/s) feed-forward -- added on top of
 // the correction so a constant-rate goal is tracked with ~zero steady-state
 // error (the brake curve alone needs err = w^2/(1.6a) to sustain rate w).
-static void track_velocity_step(double goal_pan, double goal_tilt, double dt,
+// Returns true while "busy" (meaningful error or nonzero command) so the
+// caller can relax its loop rate when idle.
+static bool track_velocity_step(double goal_pan, double goal_tilt, double dt,
                                 double ff_pan, double ff_tilt) {
     double inv_dt = 1.0 / std::max(dt, 1e-3);
-    auto vcmd = [&](int idx, double goal, double ff,
+    bool busy = false;
+    auto vcmd = [&](int idx, int slot, double goal, double ff,
                     std::atomic<float>& hud_err) {
         if (idx < 0 || idx >= (int)g_axes.size()) return;
         MotorAxis& m = g_axes[idx];
@@ -520,10 +533,19 @@ static void track_velocity_step(double goal_pan, double goal_tilt, double dt,
         }
         double vmax = (double)m.max_velocity;
         double v = std::min(vmax, std::max(-vmax, ff + corr));
-        motor_try("track", [&] { m.axis->MoveVelocity(v, a); });
+        if (aerr > 0.0 || fabs(v) > 0.01) busy = true;
+        auto now = std::chrono::steady_clock::now();
+        bool send = fabs(v - g_vcmd_last[slot]) > std::max(0.1, 0.02 * fabs(v)) ||
+                    now - g_vcmd_t[slot] > std::chrono::milliseconds(100);
+        if (send) {
+            motor_try("track", [&] { m.axis->MoveVelocity(v, a); });
+            g_vcmd_last[slot] = v;
+            g_vcmd_t[slot] = now;
+        }
     };
-    vcmd(g_tgt.pan_axis,  goal_pan,  ff_pan,  g_hud_err_pan);
-    vcmd(g_tgt.tilt_axis, goal_tilt, ff_tilt, g_hud_err_tilt);
+    vcmd(g_tgt.pan_axis,  0, goal_pan,  ff_pan,  g_hud_err_pan);
+    vcmd(g_tgt.tilt_axis, 1, goal_tilt, ff_tilt, g_hud_err_tilt);
+    return busy;
 }
 
 static void track_velocity_stop() {
@@ -534,6 +556,7 @@ static void track_velocity_stop() {
     };
     stop(g_tgt.pan_axis);
     stop(g_tgt.tilt_axis);
+    g_vcmd_last[0] = g_vcmd_last[1] = 1e30;   // force the next command through
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +602,11 @@ static std::atomic<bool> g_step_running{false};
 static float g_step_amp    = 5.0f;  // deg (edit only while not running)
 static float g_step_period = 0.5f;  // s per half-cycle
 static int   g_step_cycles = 4;
+// last results, shown in the panel (written by the tracking thread)
+static std::atomic<bool>  g_step_have{false};
+static std::atomic<float> g_step_rise_pan{-1.0f}, g_step_over_pan{0.0f};
+static std::atomic<float> g_step_rise_tilt{-1.0f}, g_step_over_tilt{0.0f};
+static std::atomic<int>   g_step_rows_n{0};
 
 struct StepRow { double t, goal, cmd_pan, act_pan, cmd_tilt, act_tilt; };
 
@@ -666,11 +694,13 @@ static void run_step_test() {
     double rise_p, over_p, rise_t, over_t;
     step_stats(rows, true,  amp, period, rise_p, over_p);
     step_stats(rows, false, amp, period, rise_t, over_t);
-    status_set("step test done (" + std::to_string(rows.size()) +
-               " rows -> step_test.csv): pan rise " + std::to_string(rise_p) +
-               " ms over " + std::to_string(over_p) + "%, tilt rise " +
-               std::to_string(rise_t) + " ms over " + std::to_string(over_t) +
-               "%");
+    g_step_rise_pan.store((float)rise_p);
+    g_step_over_pan.store((float)over_p);
+    g_step_rise_tilt.store((float)rise_t);
+    g_step_over_tilt.store((float)over_t);
+    g_step_rows_n.store((int)rows.size());
+    g_step_have.store(true);
+    status_set("step test done -> step_test.csv");
     g_step_running = false;
 }
 
@@ -760,8 +790,14 @@ static void track_thread_loop() {
                 ff_pan = ff_pan_lp;
                 ff_tilt = ff_tilt_lp;
             }
-            track_velocity_step(goal_pan, goal_tilt, dt, ff_pan, ff_tilt);
+            bool busy = track_velocity_step(goal_pan, goal_tilt, dt, ff_pan,
+                                            ff_tilt);
             was = true;
+            // relax the loop when settled: fewer motor-mutex acquisitions ->
+            // the GUI thread stays responsive; 2 ms resumes on any motion
+            std::this_thread::sleep_until(
+                t0 + std::chrono::milliseconds(busy ? 2 : 10));
+            continue;
         } else if (was) {
             track_velocity_stop();
             was = false;
@@ -769,7 +805,7 @@ static void track_thread_loop() {
             filt_tilt.reset();
             ff_pan_lp = ff_tilt_lp = 0.0;
         }
-        std::this_thread::sleep_until(t0 + std::chrono::milliseconds(2));
+        std::this_thread::sleep_until(t0 + std::chrono::milliseconds(10));
     }
     if (was) track_velocity_stop();
 }
@@ -1152,7 +1188,11 @@ static GcStatusPacket ctrl_make_status(uint16_t cmd, uint32_t seq, int32_t err) 
     bool connected = g_controller != nullptr && pan != nullptr && tilt != nullptr;
     bool in_pos = false, enabled = false;
     if (connected) {
-        // cached readback refreshed by gui_draw_axis each frame
+        // fresh reads: the GUI cache now refreshes at only ~10 Hz, which
+        // would make in-position/settle checks (calibration sweep) sluggish.
+        // A handful of RapidCode calls per GCC1 command (~2 Hz) is cheap.
+        motor_refresh(*pan);
+        motor_refresh(*tilt);
         rep.pan_deg  = pan->actual_position  - pan->zero_ref;
         rep.tilt_deg = tilt->actual_position - tilt->zero_ref;
         rep.pan_min  = pan->pos_min_deg;  rep.pan_max  = pan->pos_max_deg;
@@ -1456,8 +1496,11 @@ static void startup_connect() {
 // ---------------------------------------------------------------------------
 // gui
 // ---------------------------------------------------------------------------
-static void gui_draw_axis(MotorAxis& m) {
-    motor_refresh(m);
+static void gui_draw_axis(MotorAxis& m, bool refresh) {
+    // Readback at ~10 Hz, not every frame: each refresh is 6 RapidCode calls
+    // through the motor mutex, and doing that per axis per frame starves /
+    // stutters the GUI while the tracking thread is commanding at 500 Hz.
+    if (refresh) motor_refresh(m);
 
     ImGui::PushID(m.number);
     ImGui::SeparatorText(("Axis " + std::to_string(m.number)).c_str());
@@ -1656,6 +1699,14 @@ static void gui_draw() {
                 if (ImGui::Button("Run step test")) { g_step_request.store(true); }
                 if (busy) ImGui::EndDisabled();
                 if (busy) ImGui::TextColored(ImVec4(1, 1, 0, 1), "step test running...");
+                if (g_step_have.load()) {
+                    ImGui::Text("last: pan rise %.1f ms, overshoot %.1f%%",
+                                g_step_rise_pan.load(), g_step_over_pan.load());
+                    ImGui::Text("      tilt rise %.1f ms, overshoot %.1f%%",
+                                g_step_rise_tilt.load(), g_step_over_tilt.load());
+                    ImGui::TextDisabled("%d rows -> step_test.csv (goal/cmd/actual per iteration)",
+                                        g_step_rows_n.load());
+                }
             }
 
             // control channel (request/reply, orange commands angles / uploads calibration)
@@ -1820,8 +1871,14 @@ static void gui_draw() {
             }
         }
 
-        for (MotorAxis& m : g_axes) {
-            gui_draw_axis(m);
+        {
+            static double last_refresh = 0.0;
+            double tnow = glfwGetTime();
+            bool refresh = tnow - last_refresh >= 0.1;
+            if (refresh) last_refresh = tnow;
+            for (MotorAxis& m : g_axes) {
+                gui_draw_axis(m, refresh);
+            }
         }
     }
     ImGui::End();
@@ -1852,6 +1909,10 @@ static void render_a_frame(GLFWwindow* window) {
 }
 
 int main() {
+#ifdef _WIN32
+    timeBeginPeriod(1);   // 1 ms scheduler resolution: the tracking thread's
+                          // 2 ms sleeps would otherwise round to ~15.6 ms
+#endif
     config_load_file();
     config_load_globals();
 

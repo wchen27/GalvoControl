@@ -61,7 +61,9 @@ if(UNIX)
 endif()
 
 if(WIN32)
-    target_link_libraries(motor_control PRIVATE ws2_32)   # UDP target receiver (Winsock)
+    # ws2_32: UDP sockets. winmm: timeBeginPeriod(1) so the tracking thread's
+    # 2 ms sleeps are real instead of the ~15.6 ms scheduler default.
+    target_link_libraries(motor_control PRIVATE ws2_32 winmm)
 endif()
 
 # NOTE (Windows): RapidCode64.dll and its dependencies (KDL.dll, VMPlugin*, RMP.rta) are
