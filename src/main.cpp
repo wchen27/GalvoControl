@@ -506,9 +506,15 @@ static std::chrono::steady_clock::time_point g_vcmd_t[2];
 // error (the brake curve alone needs err = w^2/(1.6a) to sustain rate w).
 // Returns true while "busy" (meaningful error or nonzero command) so the
 // caller can relax its loop rate when idle.
-static bool track_velocity_step(double goal_pan, double goal_tilt, double dt,
+static bool track_velocity_step(double goal_pan, double goal_tilt,
                                 double ff_pan, double ff_tilt) {
-    double inv_dt = 1.0 / std::max(dt, 1e-3);
+    // Small-error gain. This region used to be capped at aerr/dt (= a P gain
+    // of 500/s at the 2 ms loop) -- unstable against the plant's few ms of
+    // command latency (gain x delay > 1), producing a sustained limit cycle
+    // whenever a moving goal kept the loop out of the deadband: mirror
+    // jitter during motion no goal-side smoothing could touch. 40/s is
+    // stable against ~10+ ms of lag and still converges residuals in ~25 ms.
+    constexpr double kSmallErrGain = 40.0; // 1/s
     bool busy = false;
     auto vcmd = [&](int idx, int slot, double goal, double ff,
                     std::atomic<float>& hud_err) {
@@ -527,8 +533,8 @@ static bool track_velocity_step(double goal_pan, double goal_tilt, double dt,
         double a    = (double)m.max_accel;
         double corr = 0.0;
         if (aerr > 0.0) {
-            corr = sqrt(2.0 * a * aerr * 0.8);      // brake curve, with margin
-            corr = std::min(corr, aerr * inv_dt);   // don't cross the goal in one update
+            corr = sqrt(2.0 * a * aerr * 0.8);           // brake curve, with margin
+            corr = std::min(corr, aerr * kSmallErrGain); // stable P region near goal
             if (err < 0.0) corr = -corr;
         }
         double vmax = (double)m.max_velocity;
@@ -538,7 +544,13 @@ static bool track_velocity_step(double goal_pan, double goal_tilt, double dt,
         bool send = fabs(v - g_vcmd_last[slot]) > std::max(0.1, 0.02 * fabs(v)) ||
                     now - g_vcmd_t[slot] > std::chrono::milliseconds(100);
         if (send) {
-            motor_try("track", [&] { m.axis->MoveVelocity(v, a); });
+            // accel scheduled to the size of the velocity change: reach the
+            // new velocity in ~4 ms, floored at 2% of max accel. Large
+            // maneuvers still get full accel; small corrections stop being
+            // full-accel jerks that hammer the mirror mechanics broadband.
+            double dv = fabs(v - (g_vcmd_last[slot] > 1e29 ? 0.0 : g_vcmd_last[slot]));
+            double a_cmd = std::min(a, std::max(dv / 0.004, 0.02 * a));
+            motor_try("track", [&] { m.axis->MoveVelocity(v, a_cmd); });
             g_vcmd_last[slot] = v;
             g_vcmd_t[slot] = now;
         }
@@ -668,12 +680,10 @@ static void run_step_test() {
         auto now = clk::now();
         double t = std::chrono::duration<double>(now - t0).count();
         if (t >= total) break;
-        double dt = std::chrono::duration<double>(now - prev).count();
         prev = now;
-        dt = std::min(std::max(dt, 1e-4), 0.05);
 
         double goal = (fmod(t, 2.0 * period) < period) ? amp : -amp;
-        track_velocity_step(goal, goal, dt, 0.0, 0.0);
+        track_velocity_step(goal, goal, 0.0, 0.0);
 
         StepRow row{t, goal, 0, 0, 0, 0};
         auto read_axis = [&](int idx, double& cmd, double& act) {
@@ -826,7 +836,7 @@ static void track_thread_loop() {
                 ff_pan = ff_pan_lp;
                 ff_tilt = ff_tilt_lp;
             }
-            bool busy = track_velocity_step(goal_pan, goal_tilt, dt, ff_pan,
+            bool busy = track_velocity_step(goal_pan, goal_tilt, ff_pan,
                                             ff_tilt);
             was = true;
             // relax the loop when settled: fewer motor-mutex acquisitions ->
