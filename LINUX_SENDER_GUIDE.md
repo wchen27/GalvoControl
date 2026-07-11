@@ -1,5 +1,11 @@
 # GalvoCam Target Sender — Linux Setup Guide
 
+> **Note:** [orange](https://github.com/moments-behavior/orange) now implements the sender
+> natively (`src/galvo_sender.cpp`, v2 packets with velocity + age, plus the GCC1 control
+> channel) — if you're using orange, nothing here is needed. This guide remains for custom
+> senders; it covers the **v1** (48-byte) packet, which the receiver still accepts. Prefer the
+> v2 format in **PROTOCOL.md** for fast-target tracking (the receiver extrapolates with it).
+
 For an agent on the **Linux triangulation machine** implementing the *sender* side of the
 GalvoCam target-streaming protocol. You send 3D world coordinates; the Windows motor-control app
 receives them and aims the mirrors. Wire spec: **PROTOCOL.md** (this guide implements it).
